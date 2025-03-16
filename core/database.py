@@ -70,10 +70,11 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
         sqlite3.Error: If connection fails
     """
     config = get_config()
-    db_path = db_path or config.db_path
+    db_path = db_path or config.databse.path
     if not db_path:
         raise ValueError("No database path provided and not found in configuration")
         
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
-    return conn
+    cursor=conn.cursor()
+    return conn, cursor

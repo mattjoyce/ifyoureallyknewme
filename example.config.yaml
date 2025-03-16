@@ -1,0 +1,42 @@
+# Database configuration
+database:
+  path: db.sqlite3
+  schema_path: schema.sql
+
+# LLM configuration
+llm:
+  generative_model: gpt-4
+  embedding_model: text-embedding-ada-002
+
+# Role configuration
+roles:
+  path: ./roles
+  schema_file: Prompt-Schema.md  
+  Observers:
+    - name: Psychologist
+      file: Role-Psychologist.md
+    - name: Demographer
+      file: Role-Demographer.md
+    - name: BehavioralEconomist
+      file: Role-BehavioralEconomist.md
+    - name: PoliticalScientist
+      file: Role-PoliticalScientist.md
+    - name: FactExtractor
+      file: Role-FactExtractor.md
+  Helpers:
+    - name: ConsensusMaker
+      file: Role-ConsensusMaker.md
+    - name: CoverageAssessor
+      file: Role-CoverageAssessor.md
+    - name: KeywordExtractor
+      file: Role-KeywordExtractor.md
+    - name: Interviewer
+      file: Role-Interviewer.md
+
+content:
+  default_author: "John Doe"
+
+# Logging configuration
+logging:
+  level: INFO
+  file: private/knowme.log 
