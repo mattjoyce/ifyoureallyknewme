@@ -60,7 +60,7 @@ def extract_json(text: str) -> Any:
     raise ValueError("No valid JSON found in text")
 
 
-def extract_keywords(prompt: str, model: Optional[str] = None) -> List[str]:
+def extract_keywords(content: str, model: Optional[str] = None) -> List[str]:
     """
     Extract keywords from text using the KeywordExtractor role.
     
@@ -75,14 +75,14 @@ def extract_keywords(prompt: str, model: Optional[str] = None) -> List[str]:
     model = model or config.llm.generative_model
     
     # Get role path
-    role_path = get_role_file("KeywordExtractor","Helper")
+    role_prompt = get_role_prompt("KeywordExtractor","Helper")
     
     try:
         # Use centralized LLM calling
         try:
             result = llm_process_with_prompt(
-                input_content=prompt,
-                role_file=str(role_path),
+                input_content=content,
+                prompt=role_prompt,
                 model=model,
                 expect_json=True
             )
@@ -111,7 +111,6 @@ def store_knowledge_record(
     cursor: sqlite3.Cursor,
     note_id: str,
     record_type: str,
-    domain: str,
     author: str,
     content: Dict[str, Any],
     timestamp: str,
@@ -132,14 +131,13 @@ def store_knowledge_record(
     cursor.execute(
         """
         INSERT INTO knowledge_records
-        (id, type, domain, author, content, created_at, version, 
+        (id, type, author, content, created_at, version, 
          embedding, session_id, qa_id, source_id, keywords)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             note_id,
             record_type,
-            domain,
             author,
             json.dumps(content),
             timestamp,
@@ -172,7 +170,6 @@ def run_role_analysis(
         List of note IDs if successful, None otherwise
     """
 
-    config=get_config()
     # Get session data
     session, qa_pairs = get_session_data(db_path, session_id)
     
@@ -181,79 +178,57 @@ def run_role_analysis(
 
     # Get role prompt
     role_prompt = get_role_prompt(role_name, "Observer")
-    print(role_name)
-    print(role_prompt)
         
     logger.info(f"Running {role_name} analysis on session {session_id}")
     
-    try:
-        # Use centralized LLM calling
-        response = llm_process_with_prompt(
-            input_content=context,
-            prompt=role_prompt,
-            model=model,
-            expect_json=True
-        )
-        
-        # Handle response format
-        observations = response if isinstance(response, list) else [response]
-        
-        # Store notes in the database
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        timestamp = datetime.utcnow().isoformat()
-        note_ids = []
-        
-        # Get all QA pairs to link observations with questions
-        qa_ids = {}
-        cursor.execute(
-            "SELECT id, question, sequence FROM qa_pairs WHERE session_id = ? ORDER BY sequence",
-            (session_id,)
-        )
-        for row in cursor.fetchall():
-            qa_ids[row[2]] = {"id": row[0], "question": row[1]}
-        
-        # Process each observation individually and link to questions
-        for obs in observations:
-            question_sequence = obs.get("question_sequence")
-            qa_id = None
-            
-            if question_sequence and question_sequence in qa_ids:
-                qa_id = qa_ids[question_sequence]["id"]
-            
-            observation_text = obs.get('observation')
-            embedding = get_embedding(observation_text)
-            embedding_bytes = embedding.tobytes()
+    # Use centralized LLM calling
+    response = llm_process_with_prompt(
+        input_content=context,
+        prompt=role_prompt,
+        model=model,
+        expect_json=True
+    )
+    
+    # Handle response format
+    observations = response if isinstance(response, list) else [response]
+    print(observations)
+    # Store notes in the database
+    conn, cursor = get_connection(db_path)
+    
+    timestamp = datetime.utcnow().isoformat()
+    note_ids = []
+      
+    # Process each observation individually and link to questions
+    for obs in observations:
+     
+        observation_text = obs.get('observation')
+        embedding = get_embedding(observation_text)
+        embedding_bytes = embedding.tobytes()
 
-            # Generate unique note ID for each observation
-            note_id = generate_id("note", session_id, expert_role, qa_id or "general")
-            
-            # Store the knowledge record
-            store_knowledge_record(
-                cursor=cursor,
-                note_id=note_id,
-                record_type="note",
-                domain=expert_role.lower(),
-                author=expert_role,
-                content=obs,
-                timestamp=timestamp,
-                embedding_bytes=embedding_bytes,
-                session_id=session_id,
-                qa_id=qa_id,
-                model=model
-            )
-            note_ids.append(note_id)
+        # Generate unique note ID for each observation
+        note_id = generate_id("note", session_id, role_name)
         
-        conn.commit()
-        conn.close()
+        # Store the knowledge record
+        store_knowledge_record(
+            cursor=cursor,
+            note_id=note_id,
+            record_type="note",
+            author=role_name,
+            content=obs,
+            timestamp=timestamp,
+            embedding_bytes=embedding_bytes,
+            session_id=session_id,
+            model=model
+        )
+        note_ids.append(note_id)
+    
+    conn.commit()
+    conn.close()
+    
+    logger.info(f"Created {len(note_ids)} {role_name} notes for session {session_id}")
+    return note_ids
         
-        logger.info(f"Created {len(note_ids)} {expert_role} notes for session {session_id}")
-        return note_ids
-        
-    except Exception as e:
-        logger.error(f"Error in expert analysis: {str(e)}")
-        return None
+
         
 
 

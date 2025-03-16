@@ -5,12 +5,16 @@ Provides abstracted interface for LLM operations to make it easy to switch provi
 
 import subprocess
 import tempfile
+import logging
 import os
+import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from .config import get_config
+from .config import get_config, configure_logging
 
+# Set up logging
+logger = logging.getLogger(__name__)
 
 def call_llm_with_prompt(
     input_content: Union[str, Dict, List], 
@@ -46,10 +50,11 @@ def call_llm_with_prompt(
     result = None
     # Currently using fabric, but this could be replaced with any LLM client
     #save the composed prompt to a temp file
-    with tempfile.NamedTemporaryFile(mode='w', delete=True) as f:
+    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
         f.write(prompt)
-        prompt_file=Path(f.name).resolve()
-        print(prompt_file)
+        prompt_file = Path(f.name).resolve()
+
+    try:
         result = subprocess.run(
             ["fabric", "--model", model, "-p", str(prompt_file)],
             input=input_str,
@@ -57,7 +62,16 @@ def call_llm_with_prompt(
             text=True,
             check=True
         )
-    print(result.stdout)
+        # Now manually delete the file after using it
+        os.unlink(prompt_file)
+    except Exception as e:
+        print(e)
+        # Still try to delete the file in case of error
+        try:
+            os.unlink(prompt_file)
+        except:
+            pass
+        return
     # Return the raw output
     return result.stdout
 
@@ -77,8 +91,7 @@ def parse_llm_response(response: str, expect_json: bool = True) -> Any:
     """
     if not expect_json:
         return response
-    
-    import json
+
     try:
         result = json.loads(response)
         return result
@@ -124,6 +137,8 @@ def llm_process_with_prompt(
 
     # Parse the response
     parsed_response = parse_llm_response(response, expect_json)
+
+
     return parsed_response
 
 
@@ -152,12 +167,14 @@ def get_role_file(role_name: str, role_type: str) -> Path:
     
     if role_type=="Observer":
         roles=config.roles.Observers
-        
+
+    if role_type=="Helper":
+        roles=config.roles.Helpers
+
     target_role = next((role for role in roles if role.name == role_name), None)
 
     # Construct the role file path
     role_file = Path(roles_path / target_role.file).resolve()
-    print(role_file)
         
     # Check if the file exists
     if not role_file.exists():
@@ -166,14 +183,14 @@ def get_role_file(role_name: str, role_type: str) -> Path:
     return role_file
 
 def get_role_prompt(role_name, role_type):
+    config=get_config()
     role_file = get_role_file(role_name, role_type)
-    print(role_file)
     with open(role_file, "r") as f:
         prompt=f.read()
-        if role_type == "observers":
+        if role_type == "Observer":
             #insert the schema into the prompt observers
-            return replace_token_with_file_contents(prompt, "{{schema}}", Path(CONFIG.roles.path) / CONFIG.database.schema_file)
-        
+            composed_prompt= replace_token_with_file_contents(prompt, "{{schema}}", Path(f"{config.roles.path}/{config.roles.schema_file}").resolve())
+            return composed_prompt
         return prompt
 
 

@@ -132,9 +132,7 @@ def analyze(
                     for expert in session["missing_observers"]:
                         table.add_row(session["id"], expert)
 
-                console.print(table)
-            else:
-                console.print("[yellow]No sessions found that need analysis[/yellow]")
+            console.print(table)
             return
 
         # Now process sessions
@@ -143,7 +141,6 @@ def analyze(
             task = progress.add_task(
                 "[green]Analyzing sessions...", total=len(sessions_for_analysis)
             )
-            print(sessions_for_analysis)
             for session in sessions_for_analysis:
                 if session["missing_observers"]:  # Only analyze sessions that need it
                     console.print(

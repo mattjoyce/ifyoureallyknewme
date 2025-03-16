@@ -23,7 +23,7 @@ def get_embedding(text: str, model: Optional[str] = None) -> np.ndarray:
     config = get_config()
     
     if model is None:
-        model = config.embedding_model
+        model = config.llm.embedding_model
     client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
 
     response = client.embeddings.create(
