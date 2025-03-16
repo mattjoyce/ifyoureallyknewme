@@ -25,7 +25,7 @@ from rich.progress import Progress
 from rich.table import Table
 
 from core.analysis import (get_unanalyzed_sessions, process_queued_document,
-                           run_multiple_expert_analyses)
+                           run_multiple_role_analyses)
 # Import core modules
 from core.config import configure_logging, get_config
 from core.database import create_database, get_connection
@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 @click.group()
 @click.version_option(version="0.1.0")
 @click.option("--config", type=click.Path(exists=True), help="Path to config file")
+# TODO add --dry-run here
 @click.pass_context
 def cli(ctx, config: Optional[str]):
     """KnowMe - Personal knowledge management and analysis system."""
@@ -81,23 +82,15 @@ def init(db_path: Optional[str]):
 
 @cli.command()
 @click.argument("db_path", type=click.Path(exists=True), required=False)
-@click.argument("session_id", required=False)
 @click.option(
     "--list", "-l", is_flag=True, help="List sessions/notes that need analysis"
 )
-@click.option(
-    "--auto", "-a", is_flag=True, help="Automatically analyze all incomplete items"
-)
-@click.option("--single", "-s", is_flag=True, help="Analyze a single selected session")
 @click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
 @click.option("--sessions", is_flag=True, help="Analyze sessions only")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
 def analyze(
     db_path: Optional[str],
-    session_id: Optional[str],
     list: bool,
-    auto: bool,
-    single: bool,
     queue: bool,
     sessions: bool,
     model: Optional[str],
@@ -106,11 +99,11 @@ def analyze(
     Run expert analysis on content.
 
     If --list is provided, shows items that need analysis.
-    If --auto is provided, automatically analyzes all incomplete items.
-    If --single is provided, prompts for selection of a single session to analyze.
+    If --session is provided, processes all sessions.
     If --queue is provided, processes items in the analysis queue.
     """
-    db_path = db_path or CONFIG.get("database", {}).get("path")
+    config=get_config()
+    db_path = db_path or config.database.path
     if not db_path:
         console.print(
             "[red]Error: No database path provided and not found in configuration[/red]"
@@ -118,72 +111,73 @@ def analyze(
         return
 
     # Load expert roles from config
-    experts = CONFIG.get("roles", {}).get("experts", [])
-    if not experts:
-        console.print("[red]Error: No expert roles found in configuration[/red]")
+    observer_names = [observer.name for observer in config.roles.Observers]
+
+    if not observer_names:
+        console.print("[red]Error: No observer roles found in configuration[/red]")
         return
 
-    # Determine what to analyze based on options
-    analyze_sessions = sessions or not queue
-    analyze_queue = queue or not sessions
+    if sessions:
+        sessions_for_analysis = get_unanalyzed_sessions(db_path, observer_names)
 
-    # List mode - show both QA sessions and queue items
-    if list:
-        console.print("[blue]Listing items that need analysis...[/blue]")
+        if list:
+            console.print("[blue]Listing items that need analysis...[/blue]")
 
-        if analyze_sessions:
-            # SQL query to find sessions missing analysis for specific experts
-            conn = sqlite3.connect(db_path)
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT s.id AS session_id, e.name AS expert_name
-                FROM sessions s
-                CROSS JOIN (
-                    SELECT 'Psychologist' AS name
-                    UNION ALL
-                    SELECT 'Demographer'
-                    UNION ALL
-                    SELECT 'BehavioralEconomist'
-                    UNION ALL
-                    SELECT 'PoliticalScientist'
-                ) e
-                LEFT JOIN knowledge_records kr ON s.id = kr.session_id AND kr.author = e.name
-                WHERE kr.session_id IS NULL
-                ORDER BY s.id, e.name;
-            """
-            )
+            table = Table(title="Sessions Missing Expert Analysis")
+            table.add_column("Session ID", style="cyan")
+            table.add_column("Expert Name", style="green")
 
-            missing_analysis = cursor.fetchall()
-            conn.close()
-
-            if missing_analysis:
-                table = Table(title="Sessions Missing Expert Analysis")
-                table.add_column("Session ID", style="cyan")
-                table.add_column("Expert Name", style="green")
-
-                for row in missing_analysis:
-                    table.add_row(row["session_id"], row["expert_name"])
+            for session in sessions_for_analysis:
+                if not session["is_complete"]:
+                    for expert in session["missing_observers"]:
+                        table.add_row(session["id"], expert)
 
                 console.print(table)
             else:
                 console.print("[yellow]No sessions found that need analysis[/yellow]")
+            return
 
-        if analyze_queue:
-            # Get queue items
-            conn = get_connection(db_path)
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT id, name, author, lifestage, filename, created_at 
-                FROM analysis_queue 
-                WHERE completed = 0
-                ORDER BY created_at
-            """
+        # Now process sessions
+        console.print("[blue]Analyzing all incomplete sessions[/blue]")        
+        with Progress() as progress:
+            task = progress.add_task(
+                "[green]Analyzing sessions...", total=len(sessions_for_analysis)
             )
-            queue_items = cursor.fetchall()
-            conn.close()
+            print(sessions_for_analysis)
+            for session in sessions_for_analysis:
+                if session["missing_observers"]:  # Only analyze sessions that need it
+                    console.print(
+                        f"[blue]Analyzing session {session['id']} ({session['title']})...[/blue]"
+                    )
+                    results = run_multiple_role_analyses(
+                        db_path, session["id"], session["missing_observers"], model
+                    )
+
+                    # Display results
+                    for expert, count in results.items():
+                        console.print(
+                            f"[green]Created {count} observations from {expert}[/green]"
+                        )
+
+                progress.update(task, advance=1)
+
+
+    if queue:
+        # Get queue items
+        conn = get_connection(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, name, author, lifestage, filename, created_at 
+            FROM analysis_queue 
+            WHERE status = 'pending'
+            ORDER BY created_at
+        """
+        )
+        queue_items = cursor.fetchall()
+        conn.close()
+
+        if list:
 
             if queue_items:
                 queue_table = Table(title="Document Analysis Queue")
@@ -206,192 +200,7 @@ def analyze(
 
                 console.print(queue_table)
 
-        if not sessions and not queue_items:
-            console.print("[yellow]No items found that need analysis[/yellow]")
 
-        # If auto mode is enabled, continue to analyze
-        if not auto:
-            return
-
-    # Auto mode - process both QA and queue items
-    if auto:
-        console.print("[blue]Automatically analyzing all incomplete items...[/blue]")
-
-        # Process QA sessions
-        sessions = get_unanalyzed_sessions(db_path, experts)
-        if sessions:
-            console.print("\n[bold blue]Processing QA Sessions:[/bold blue]")
-            with Progress() as progress:
-                task = progress.add_task(
-                    "[green]Analyzing sessions...", total=len(sessions)
-                )
-
-                for session in sessions:
-                    if session["missing_experts"]:  # Only analyze sessions that need it
-                        console.print(
-                            f"[blue]Analyzing session {session['id']} ({session['title']})...[/blue]"
-                        )
-                        results = run_multiple_expert_analyses(
-                            db_path, session["id"], session["missing_experts"], model
-                        )
-
-                        # Display results
-                        for expert, count in results.items():
-                            console.print(
-                                f"[green]Created {count} observations from {expert}[/green]"
-                            )
-
-                    progress.update(task, advance=1)
-
-        # Process queue items
-        conn = get_connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM analysis_queue WHERE completed = 0")
-        queue_items = cursor.fetchall()
-        conn.close()
-
-        if queue_items:
-            console.print("\n[bold blue]Processing Queue Items:[/bold blue]")
-            with Progress() as progress:
-                task = progress.add_task(
-                    "[green]Processing documents...", total=len(queue_items)
-                )
-
-                for item in queue_items:
-                    console.print(
-                        f"[blue]Processing {item[1]} ({Path(item[4]).name})...[/blue]"
-                    )
-                    try:
-                        # Process the document using the new function
-                        results = process_queued_document(
-                            db_path, item[0], experts, model
-                        )
-
-                        # Display results
-                        if results:
-                            for expert, count in results.items():
-                                console.print(
-                                    f"[green]Created {count} observations from {expert}[/green]"
-                                )
-                        else:
-                            console.print(
-                                f"[yellow]No observations created for {item[1]}[/yellow]"
-                            )
-
-                    except Exception as e:
-                        console.print(
-                            f"[red]Error processing {item[1]}: {str(e)}[/red]"
-                        )
-
-                    progress.update(task, advance=1)
-
-        console.print("[green]Completed automatic analysis[/green]")
-        return
-
-    # Queue-specific mode
-    if queue:
-        conn = get_connection(db_path)
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM analysis_queue WHERE completed = 0")
-        queue_items = cursor.fetchall()
-        conn.close()
-
-        if not queue_items:
-            console.print("[yellow]No items in the analysis queue[/yellow]")
-            return
-
-        # Display queue items
-        table = Table(title="Analysis Queue")
-        table.add_column("Index", style="cyan")
-        table.add_column("Name", style="green")
-        table.add_column("Author", style="blue")
-        table.add_column("File", style="magenta")
-
-        for idx, item in enumerate(queue_items, 1):
-            table.add_row(str(idx), item[1], item[2], str(Path(item[4]).name))
-
-        console.print(table)
-
-        # Get user selection
-        selection = click.prompt("Enter item index to process", type=int)
-        if selection < 1 or selection > len(queue_items):
-            console.print("[red]Invalid selection[/red]")
-            return
-
-        item = queue_items[selection - 1]
-        console.print(f"[blue]Processing {item[1]}...[/blue]")
-
-        try:
-            # Process the document using the new function
-            results = process_queued_document(db_path, item[0], experts, model)
-
-            # Display results
-            if results:
-                for expert, count in results.items():
-                    console.print(
-                        f"[green]Created {count} observations from {expert}[/green]"
-                    )
-            else:
-                console.print(f"[yellow]No observations created for {item[1]}[/yellow]")
-        except Exception as e:
-            console.print(f"[red]Error processing {item[1]}: {str(e)}[/red]")
-
-        return
-
-    # Single session mode (or if session_id provided) - QA only
-    if single or session_id:
-        # If no session_id provided, prompt for selection
-        if not session_id:
-            sessions = get_unanalyzed_sessions(db_path, experts)
-
-            # Create selection table
-            table = Table(title="Available Sessions")
-            table.add_column("Index", style="cyan")
-            table.add_column("ID", style="blue")
-            table.add_column("Title", style="green")
-            table.add_column("Missing Experts", style="yellow")
-
-            # Filter to sessions needing analysis
-            incomplete_sessions = [s for s in sessions if s["missing_experts"]]
-
-            for idx, session in enumerate(incomplete_sessions, 1):
-                table.add_row(
-                    str(idx),
-                    session["id"],
-                    session["title"],
-                    ", ".join(session["missing_experts"]),
-                )
-
-            console.print(table)
-
-            # Get user selection
-            selection = click.prompt("Enter session index to analyze", type=int)
-            if selection < 1 or selection > len(incomplete_sessions):
-                console.print("[red]Invalid selection[/red]")
-                return
-
-            session = incomplete_sessions[selection - 1]
-            session_id = session["id"]
-            missing_experts = session["missing_experts"]
-        else:
-            # Get missing experts for provided session_id
-            sessions = get_unanalyzed_sessions(db_path, experts)
-            session = next((s for s in sessions if s["id"] == session_id), None)
-            if not session:
-                console.print(f"[red]Session {session_id} not found[/red]")
-                return
-            missing_experts = session["missing_experts"]
-
-        console.print(f"[blue]Analyzing session {session_id}...[/blue]")
-        results = run_multiple_expert_analyses(
-            db_path, session_id, missing_experts, model
-        )
-
-        # Display results
-        for expert, count in results.items():
-            console.print(f"[green]Created {count} observations from {expert}[/green]")
-
-        console.print(f"[green]Completed analysis of session {session_id}[/green]")
 
 
 @cli.command()
@@ -568,7 +377,7 @@ def queue(
 
     # List mode is dominant mode. If --list is provided, ignore other options.
 
-    ## ANALYSIS QUEUE tabel is documents not sessions
+    ## ANALYSIS QUEUE tabel is for documents not sessions
     if list:
         conn, cursor = get_connection(config.database.path)
         cursor.execute(
@@ -586,16 +395,16 @@ def queue(
             return
 
         table = Table(title="Analysis Queue")
-        table.add_column("ID", style="cyan")
+        table.add_column("ID", style="red")
         table.add_column("Name", style="green")
-        table.add_column("Author", style="blue")
+        table.add_column("Author", style="yellow")
+        table.add_column("Life Stage", style="blue")
         table.add_column("Type", style="magenta")
-        table.add_column("File", style="yellow")
-        table.add_column("Life Stage", style="orange")
-        table.add_column("Status", style="gold")
+        table.add_column("File", style="cyan")
+        table.add_column("Status", style="white")
 
         for item in queue_items:
-            table.add_row(item[0], item[1], item[2], item[4], item[3], item[7], item[8])
+            table.add_row(item[0], item[1], item[2], item[3], item[4], item[5], item[7])
 
         console.print(table)
         return
@@ -790,23 +599,19 @@ def queue(
         return
 
     # Queue the files
-    conn, cursor = get_connection(config.database.path)
+
     try:
         for item in queue_items:
-            cursor.execute(
-                """
-                INSERT INTO analysis_queue (
-                    id, name, author, lifestage, type, filename, created_at,
-                    priority, status, expert_status, fact_status, dependencies
-                ) VALUES (
-                    :id, :name, :author, :lifestage, :type, :filename, :created_at,
-                    :priority, :status, :expert_status, :fact_status, :dependencies
-                )
-            """,
-                item,
+            file_queue_id=process_content(
+                config.database.path,
+                item["filename"],
+                item["name"],
+                item["author"],
+                item["lifestage"],
+                item["type"],
+                item["filename"],
             )
 
-        conn.commit()
         console.print(
             f"[green]Successfully queued {len(queue_items)} files for analysis[/green]"
         )
@@ -816,8 +621,6 @@ def queue(
             [f"[bold]{item['name']}:[/bold] {item['id']}" for item in queue_items]
         )
         console.print(Panel(ids_text, title="Queue IDs", border_style="green"))
-        cursor.close()
-        conn.close()
 
     except Exception as e:
         conn.rollback()
