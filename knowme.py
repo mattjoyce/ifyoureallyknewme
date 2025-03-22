@@ -20,9 +20,8 @@ from rich.panel import Panel
 from rich.progress import Progress
 from rich.table import Table
 
-from core.analysis import (get_unanalyzed_sessions, process_queued_document,
-                           run_multiple_role_analyses)
-# Import core modules
+from core.analysis import AnalysisManager
+from core.consensus import ConsensusManager
 from core.config import configure_logging, get_config
 from core.database import create_database, get_connection
 from core.ingest import process_content
@@ -32,25 +31,38 @@ from core.utils import generate_id, resolve_file_patterns
 console = Console()
 
 # Set up basic logging - this will be properly configured once config is loaded
-logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[])
+logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[])
 logger = logging.getLogger(__name__)
 
 
 @click.group()
 @click.version_option(version="0.1.0")
 @click.option("--config", type=click.Path(exists=True), help="Path to config file")
-# TODO add --dry-run here
+@click.option("--db-path", type=click.Path(), help="Override database path from config")
+@click.option("--model", help="Override LLM model from config")
 @click.pass_context
-def cli(ctx, config: Optional[str]):
+def cli(ctx, config: Optional[str], db_path: Optional[str], model: Optional[str]):
     """KnowMe - Personal knowledge management and analysis system."""
-    # Update global CONFIG if config file path provided
-    ctx.obj = CONFIG = get_config(config)
+    # Load the base configuration
+    cfg = get_config(config)
     console.print(f"[blue]Loaded configuration from {config or 'default path'}[/blue]")
+
+    # Apply overrides if provided
+    if db_path:
+        cfg.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
     
+    if model:
+        cfg.llm.generative_model = model
+        console.print(f"[blue]Overriding LLM model: {model}[/blue]")
+
+    # Store the config in the Click context for access in subcommands
+    ctx.obj = cfg
+
     # Configure logging based on loaded config
-    log_level = CONFIG.logging.level
-    log_file = CONFIG.logging.file
-    
+    log_level = cfg.logging.level
+    log_file = cfg.logging.file
+
     logger.debug(f"Updating logging configuration: level={log_level}, file={log_file}")
     configure_logging(level=log_level, log_file=log_file)
     logger.info(f"Logging configured with level={log_level}, file={log_file}")
@@ -58,24 +70,22 @@ def cli(ctx, config: Optional[str]):
 
 @cli.command()
 @click.argument("db_path", type=click.Path(), required=False)
-def init(db_path: Optional[str]):
+@click.pass_context
+def init(ctx, db_path: Optional[str]):
     """
     Initialize a new knowledge database.
 
     DB_PATH is the path where the database will be created.
     If not provided, uses the path from configuration.
     """
-    config = get_config()
-    if not db_path:
-        db_path = config.database.path
-        if not click.confirm(f"Do you want to use {db_path} from config?"):
-            return
-
+    config = ctx.obj
+    db_path = db_path or config.database.path
     # Check if database already exists
     if Path(db_path).exists():
         console.print(f"[yellow]Warning: Database {db_path} already exists[/yellow]")
+        return
 
-    success = create_database(db_path)
+    success = create_database(config.database.path)
     if not success:
         console.print(f"[red]Error creating database at {db_path}[/red]")
         return
@@ -91,7 +101,8 @@ def init(db_path: Optional[str]):
 @click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
 @click.option("--sessions", is_flag=True, help="Analyze sessions only")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
-def analyze(
+@click.pass_context
+def analyze(ctx,
     db_path: Optional[str],
     list: bool,
     queue: bool,
@@ -105,13 +116,26 @@ def analyze(
     If --session is provided, processes all sessions.
     If --queue is provided, processes items in the analysis queue.
     """
-    config=get_config()
-    db_path = db_path or config.database.path
+    config = ctx.obj
+    # Apply overrides if provided
+    if db_path:
+        config.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
+    
+    if model:
+        config.llm.generative_model = model
+        console.print(f"[blue]Overriding LLM model: {model}[/blue]")
+
     if not db_path:
         console.print(
-            "[red]Error: No database path provided and not found in configuration[/red]"
+            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
         )
         return
+
+
+
+
+    analysis_manager = AnalysisManager(config)
 
     # Load expert roles from config
     observer_names = [observer.name for observer in config.roles.Observers]
@@ -121,7 +145,7 @@ def analyze(
         return
 
     if sessions:
-        sessions_for_analysis = get_unanalyzed_sessions(db_path, observer_names)
+        sessions_for_analysis = analysis_manager.get_unanalyzed_sessions(observer_names)
 
         if list:
             console.print("[blue]Listing items that need analysis...[/blue]")
@@ -139,7 +163,7 @@ def analyze(
             return
 
         # Now process sessions
-        console.print("[blue]Analyzing all incomplete sessions[/blue]")        
+        console.print("[blue]Analyzing all incomplete sessions[/blue]")
         with Progress() as progress:
             task = progress.add_task(
                 "[green]Analyzing sessions...", total=len(sessions_for_analysis)
@@ -149,8 +173,11 @@ def analyze(
                     console.print(
                         f"[blue]Analyzing session {session['id']} ({session['title']})...[/blue]"
                     )
-                    results = run_multiple_role_analyses(config,
-                        db_path, session["id"], session["missing_observers"], config.roles.schema_file, model
+                    results = analysis_manager.run_multiple_role_analyses(
+                        session["id"],
+                        session["missing_observers"],
+                        config.roles.schema_file,
+                        model,
                     )
 
                     # Display results
@@ -161,11 +188,9 @@ def analyze(
 
                 progress.update(task, advance=1)
 
-
     if queue:
         # Get queue items
-        conn = get_connection(db_path)
-        cursor = conn.cursor()
+        conn, cursor = get_connection(config.database.path)
         cursor.execute(
             """
             SELECT id, name, author, lifestage, filename, created_at 
@@ -199,8 +224,6 @@ def analyze(
                     )
 
                 console.print(queue_table)
-
-
 
 
 @cli.command()
@@ -243,24 +266,25 @@ def merge(
     # Convert type to singular form for database query
     record_type = "note" if type.lower() == "notes" else "fact"
 
-    # Import the consensus module
-    from core.consensus import ConsensusManager
-
     # Initialize the consensus manager
     consensus_manager = ConsensusManager(config, db_path)
 
     if list:
         # Just list clusters without creating consensus
         console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
-        
+
         result = consensus_manager.list_clusters(threshold, record_type)
-        
+
         if not result["clusters"]:
-            console.print("[yellow]No clusters found with the current threshold.[/yellow]")
+            console.print(
+                "[yellow]No clusters found with the current threshold.[/yellow]"
+            )
             return
-            
-        console.print(f"[green]Found {result['cluster_count']} clusters containing {result['record_count']} observations[/green]")
-        
+
+        console.print(
+            f"[green]Found {result['cluster_count']} clusters containing {result['record_count']} observations[/green]"
+        )
+
         # Create a table to display clusters
         table = Table(title=f"Observation Clusters (threshold={threshold})")
         table.add_column("Cluster", style="cyan")
@@ -269,51 +293,56 @@ def merge(
         table.add_column("Avg. Similarity", style="yellow", justify="right")
         table.add_column("Domains", style="magenta")
         table.add_column("Sample Observation", style="white")
-        
+
         for cluster_id, cluster in result["clusters"].items():
             # Truncate sample observation if too long
             sample = cluster["observations"][0]
             if len(sample) > 60:
                 sample = sample[:57] + "..."
-                
+
             # Format domains as comma-separated list
             domains = ", ".join(cluster["domains"]) if cluster["domains"] else "-"
-            
+
             table.add_row(
                 cluster_id,
                 cluster["life_stage"],
                 str(cluster["observation_count"]),
                 f"{cluster['average_similarity']:.2f}",
                 domains,
-                sample
+                sample,
             )
-            
+
         console.print(table)
         return
-        
+
     # Process clusters and create consensus
     console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
-    
+
     try:
         result = consensus_manager.process_clusters(
-            threshold=threshold,
-            record_type=record_type,
-            model=model,
-            whatif=whatif
+            threshold=threshold, record_type=record_type, model=model, whatif=whatif
         )
-        
+
         if not result["clusters"]:
-            console.print("[yellow]No clusters found with the current threshold.[/yellow]")
+            console.print(
+                "[yellow]No clusters found with the current threshold.[/yellow]"
+            )
             return
-            
+
         mode = "What-if" if whatif else "Actual"
-        console.print(f"[green]{mode} merge complete with threshold {threshold}[/green]")
-        
+        console.print(
+            f"[green]{mode} merge complete with threshold {threshold}[/green]"
+        )
+
         if whatif:
-            console.print(f"Would create approximately {len(result['clusters'])} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations")
+            console.print(
+                f"Would create approximately {len(result['clusters'])} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations"
+            )
         else:
-            console.print(f"Created {result['consensus_count']} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations")
-            
+            console.print(
+                f"Created {result['consensus_count']} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations"
+            )
+
     except Exception as e:
         console.print(f"[red]Error during consensus processing: {str(e)}[/red]")
         logging.exception("Error during consensus processing")
@@ -671,7 +700,7 @@ def queue(
 
     try:
         for item in queue_items:
-            file_queue_id=process_content(
+            file_queue_id = process_content(
                 config.database.path,
                 item["filename"],
                 item["name"],

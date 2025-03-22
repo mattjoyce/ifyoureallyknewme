@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 
 import numpy as np
 from .config import ConfigSchema
-from .utils import generate_id
+from .utils import generate_id, extract_json
 from .ingest import get_session_data, create_session_context
 from .embedding import get_embedding
 from .llm_calling import llm_process_with_prompt, get_role_prompt
@@ -26,331 +26,119 @@ from .database import get_connection
 logger = logging.getLogger(__name__)
 
 
+class AnalysisManager:
+    def __init__(self, config:ConfigSchema):
+        self.config = config
 
+    def extract_keywords(self, content: str) -> List[str]:
+        """
+        Extract keywords from text using the KeywordExtractor role.
+        """
 
+        MODEL_NAME=self.config.llm.generative_model
 
-
-
-def extract_json(text: str) -> Any:
-    """
-    Extract JSON from text that may contain other content.
-
-    Args:
-        text: Text that may contain JSON
-
-    Returns:
-        Parsed JSON object
-
-    Raises:
-        ValueError: If no valid JSON is found
-    """
-    import re
-    import json
-
-    # Look for JSON patterns
-    json_patterns = [
-        r"\[\s*\{.*\}\s*\]",  # Array of objects
-        r"\{.*\}",  # Object
-        r"\[.*\]",  # Array
-    ]
-
-    for pattern in json_patterns:
-        matches = re.finditer(pattern, text, re.DOTALL)
-        for match in matches:
-            potential_json = match.group()
-            try:
-                result = json.loads(potential_json)
-                return result
-            except json.JSONDecodeError:
-                pass
-
-    raise ValueError("No valid JSON found in text")
-
-
-def extract_keywords(config: ConfigSchema, content: str, model: Optional[str] = None) -> List[str]:
-    """
-    Extract keywords from text using the KeywordExtractor role.
-    """
-    # Type safety check
-    if not isinstance(content, str) or not content:
-        logger.warning(
-            f"extract_keywords received non-string or empty content: {type(content)}"
-        )
-        return []
-
-    # Get role path
-    role_prompt = get_role_prompt(config,"KeywordExtractor", "Helper")
-
-    try:
-        # Use centralized LLM calling
-        result = llm_process_with_prompt(config,
-            input_content=content, prompt=role_prompt, model=model, expect_json=True
-        )
-
-        # Make sure result is a dictionary before trying to extract keywords
-        if isinstance(result, dict) and "keywords" in result:
-            keywords_str = result["keywords"]
-        else:
-            # Try to extract keywords from the result
-            try:
-                parsed_result = extract_json(result)
-                keywords_str = parsed_result.get("keywords", "")
-            except Exception as e:
-                logger.error(f"Failed to extract keywords JSON: {str(e)}")
-                return []
-
-        # Process the comma-separated output
-        if isinstance(keywords_str, str):
-            keywords = [kw.strip() for kw in keywords_str.split(",")]
-            return [kw for kw in keywords if kw]  # Filter out empty strings
-        else:
-            logger.warning(f"Expected string for keywords, got {type(keywords_str)}")
+        # Type safety check
+        if not isinstance(content, str) or not content:
+            logger.warning(
+                f"extract_keywords received non-string or empty content: {type(content)}"
+            )
             return []
 
-    except Exception as e:
-        logger.error(f"Error in keyword extraction: {str(e)}")
-        return []
+        # Get role path
+        role_prompt = get_role_prompt(self.config,"KeywordExtractor", "Helper")
+
+        try:
+            # Use centralized LLM calling
+            result = llm_process_with_prompt(self.config,
+                input_content=content, prompt=role_prompt, model=MODEL_NAME, expect_json=True
+            )
+
+            # Make sure result is a dictionary before trying to extract keywords
+            if isinstance(result, dict) and "keywords" in result:
+                keywords_str = result["keywords"]
+            else:
+                # Try to extract keywords from the result
+                try:
+                    parsed_result = extract_json(result)
+                    keywords_str = parsed_result.get("keywords", "")
+                except Exception as e:
+                    logger.error(f"Failed to extract keywords JSON: {str(e)}")
+                    return []
+
+            # Process the comma-separated output
+            if isinstance(keywords_str, str):
+                keywords = [kw.strip() for kw in keywords_str.split(",")]
+                return [kw for kw in keywords if kw]  # Filter out empty strings
+            else:
+                logger.warning(f"Expected string for keywords, got {type(keywords_str)}")
+                return []
+
+        except Exception as e:
+            logger.error(f"Error in keyword extraction: {str(e)}")
+            return []
 
 
-def store_knowledge_record(config:ConfigSchema,
-    cursor: sqlite3.Cursor,
-    note_id: str,
-    record_type: str,
-    author: str,
-    content: Dict[str, Any],
-    timestamp: str,
-    embedding_bytes: bytes,
-    session_id: Optional[str] = None,
-    qa_id: Optional[str] = None,
-    source_id: Optional[str] = None,
-    model: Optional[str] = None
-) -> None:
-    """
-    Store a knowledge record with keywords.
-    """
-    # Extract keywords from the observation text
-    observation_text = content.get("observation", content.get("content", ""))
-
-    # # Make sure observation_text is a string
-    # if isinstance(observation_text, dict):
-    #     # If it's a dictionary, convert it to a string representation
-    #     observation_text = json.dumps(observation_text)
-    #     print(f"mid : {observation_text}")
-    # elif not isinstance(observation_text, str):
-    #     # If it's any other non-string type, convert to string
-    #     observation_text = str(observation_text) if observation_text else ""
-    #     print(f"non-str : {observation_text}")
-
-    # Now extract keywords from the string
-    keywords = extract_keywords(config, observation_text, model)
-    logger.info(f"keywords : {keywords}")
-
-    # Store as knowledge record
-    cursor.execute(
+    def store_knowledge_record(self,
+        cursor: sqlite3.Cursor,
+        note_id: str,
+        record_type: str,
+        author: str,
+        content: Dict[str, Any],
+        timestamp: str,
+        embedding_bytes: bytes,
+        session_id: Optional[str] = None,
+        qa_id: Optional[str] = None,
+        source_id: Optional[str] = None
+    ) -> None:
         """
-        INSERT INTO knowledge_records
-        (id, type, author, content, created_at, version, 
-         embedding, session_id, qa_id, source_id, keywords)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            note_id,
-            record_type,
-            author,
-            json.dumps(content),
-            timestamp,
-            "1.0",
-            embedding_bytes,
-            session_id,
-            qa_id,
-            source_id,
-            ",".join(keywords) if keywords else None,
-        ),
-    )
+        Store a knowledge record with keywords.
+        """
 
+        MODEL_NAME=self.config.llm.generative_model
 
-def run_role_analysis(config:ConfigSchema,
-    db_path: str, session_id: str, role_name: str, model: Optional[str] = None
-) -> Optional[List[str]]:
-    """
-    Run expert analysis on a session and store observations.
-    """
-    logger.debug(f"Starting role analysis for {role_name} on session {session_id}")
+        # Extract keywords from the observation text
+        observation_text = content.get("observation", content.get("content", ""))
 
-    # Check if analysis already exists
-    conn, cursor = get_connection(db_path)
-    cursor.execute(
-        "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
-        (session_id, role_name),
-    )
-    existing_count = cursor.fetchone()[0]
-    conn.close()
+        # Now extract keywords from the string
+        keywords = self.extract_keywords(self.config, observation_text, MODEL_NAME)
+        logger.info(f"keywords : {keywords}")
 
-    if existing_count > 0:
-        logger.info(
-            f"Analysis for {role_name} on session {session_id} already exists with {existing_count} records"
-        )
-        # Do you want to return existing records or regenerate?
-        # For debugging, let's continue and regenerate
-
-    try:
-        # Get session data
-        logger.debug(f"Retrieving session data for {session_id}")
-        session, qa_pairs = get_session_data(db_path, session_id)
-        logger.debug(
-            f"Session data retrieved: {session['title']}, {len(qa_pairs)} QA pairs"
-        )
-
-        # Create input data
-        input_content = create_session_context(session, qa_pairs)
-        logger.debug(f"Created session context, length: {len(input_content)}")
-
-        # Get role prompt
-        role_prompt = get_role_prompt(config, role_name, "Observer")
-        logger.debug(
-            f"Retrieved role prompt for {role_name}, length: {len(role_prompt)}"
-        )
-
-        # Use centralized LLM calling
-        logger.info(f"Calling LLM for {role_name} analysis on session {session_id}")
-        response = llm_process_with_prompt(config,
-            input_content=input_content,
-            prompt=role_prompt,
-            model=model,
-            expect_json=True,
-        )
-
-        # Check response type
-        logger.debug(f"LLM response type: {type(response)}")
-        if isinstance(response, list):
-            logger.debug(f"Response is a list with {len(response)} items")
-        elif isinstance(response, dict):
-            logger.debug(
-                f"Response is a dictionary with keys: {', '.join(response.keys())}"
-            )
-        else:
-            logger.debug(f"Response is of unexpected type: {type(response)}")
-
-        # Handle response format
-        observations = response if isinstance(response, list) else [response]
-        logger.debug(f"Extracted {len(observations)} observations")
-
-        # Store notes in the database
-        conn, cursor = get_connection(db_path)
-
-        timestamp = datetime.utcnow().isoformat()
-        note_ids = []
-
-        logger.info(f"Storing {len(observations)} observations for {role_name}")
-
-        # Process each observation individually
-        for idx, obs in enumerate(observations):
-            logger.debug(f"Processing observation {idx+1}/{len(observations)}")
-
-            observation_text = obs.get("observation")
-            if not observation_text:
-                logger.warning(f"Observation {idx+1} missing 'observation' field")
-                continue
-
-            embedding = get_embedding(config,observation_text)
-            embedding_bytes = embedding.tobytes()
-
-             # Generate unique note ID for each observation
-            note_id = generate_id("note", session_id, role_name)
-            logger.debug(f"Generated note ID: {note_id}")
-
-            # Store the knowledge record
-            try:
-                store_knowledge_record(config,
-                    cursor=cursor,
-                    note_id=note_id,
-                    record_type="note",
-                    author=role_name,
-                    content=obs,
-                    timestamp=timestamp,
-                    embedding_bytes=embedding_bytes,
-                    session_id=session_id,
-                    model=model,
-                )
-                note_ids.append(note_id)
-                logger.debug(f"Stored knowledge record: {note_id}")
-
-                # Commit after each record
-                conn.commit()
-                logger.debug(f"Committed record {note_id} to database")
-            except Exception as e:
-                logger.error(f"Error storing record {note_id}: {str(e)}")
-                # Continue with other observations
-
-        # Final database verification
+        # Store as knowledge record
         cursor.execute(
-            "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
-            (session_id, role_name),
+            """
+            INSERT INTO knowledge_records
+            (id, type, author, content, created_at, version, 
+            embedding, session_id, qa_id, source_id, keywords)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                note_id,
+                record_type,
+                author,
+                json.dumps(content),
+                timestamp,
+                "1.0",
+                embedding_bytes,
+                session_id,
+                qa_id,
+                source_id,
+                ",".join(keywords) if keywords else None,
+            ),
         )
-        final_count = cursor.fetchone()[0]
-        logger.info(
-            f"Final database count for {role_name} on session {session_id}: {final_count} records"
-        )
-
-        conn.close()
-
-        return note_ids
-
-    except Exception as e:
-        logger.error(f"Error in run_role_analysis: {str(e)}", exc_info=True)
-        return None
 
 
-def run_multiple_role_analyses(config :ConfigSchema, db_path: str, session_id: str, role_names: List[str], role_schema_file: str, model: Optional[str] = None
-) -> Dict[str, int]:
-    """
-    Run multiple expert analyses on a session.
-    """
-    logger.info(
-        f"Starting analysis for session {session_id} with {len(role_names)} roles"
-    )
-    # Debug log the roles we're about to process
-    logger.debug(f"Will process these roles: {', '.join(role_names)}")
+    def run_role_analysis(self, session_id: str, role_name: str, ) -> Optional[List[str]]:
+        """
+        Run expert analysis on a session and store observations.
+        """
 
-    # Check if session exists before processing
-    conn, cursor = get_connection(db_path)
-    cursor.execute("SELECT id, title FROM sessions WHERE id = ?", (session_id,))
-    session_info = cursor.fetchone()
-    if not session_info:
-        logger.error(f"Session {session_id} not found in database")
-        conn.close()
-        return {}
-    logger.debug(f"Found session: {session_info['title']} ({session_id})")
+        DB_PATH=self.config.database.path
+        MODEL_NAME=self.config.llm.generative_model
 
-    # Check which roles have already been processed
-    all_processed = True
-    for role_name in role_names:
-        cursor.execute(
-            "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
-            (session_id, role_name),
-        )
-        count = cursor.fetchone()[0]
-        if count > 0:
-            logger.debug(
-                f"Role {role_name} already has {count} records for session {session_id}"
-            )
-        else:
-            all_processed = False
-            logger.debug(f"Role {role_name} needs processing for session {session_id}")
+        logger.debug(f"Starting role analysis for {role_name} on session {session_id}")
 
-    if all_processed:
-        logger.info(f"All roles already processed for session {session_id}")
-        conn.close()
-        return {role: 0 for role in role_names}
-
-    conn.close()
-
-    results = {}
-    for role_name in role_names:
-        logger.info(f"Processing role: {role_name} for session {session_id}")
-
-        # Check if this role already has records
-        conn, cursor = get_connection(db_path)
+        # Check if analysis already exists
+        conn, cursor = get_connection(DB_PATH)
         cursor.execute(
             "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
             (session_id, role_name),
@@ -359,138 +147,312 @@ def run_multiple_role_analyses(config :ConfigSchema, db_path: str, session_id: s
         conn.close()
 
         if existing_count > 0:
-            logger.info(f"Skipping {role_name} - already has {existing_count} records")
-            results[role_name] = existing_count
-            continue
-
-        note_ids = run_role_analysis(config, db_path, session_id, role_name, model=model)
-
-        # Verify results were stored
-        conn, cursor = get_connection(db_path)
-        cursor.execute(
-            "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
-            (session_id, role_name),
-        )
-        new_count = cursor.fetchone()[0]
-        conn.close()
-
-        if note_ids:
-            results[role_name] = len(note_ids)
             logger.info(
-                f"Created {len(note_ids)} {role_name} notes for session {session_id}"
+                f"Analysis for {role_name} on session {session_id} already exists with {existing_count} records"
             )
-            logger.debug(f"Database now shows {new_count} records for {role_name}")
+            # Do you want to return existing records or regenerate?
+            # For debugging, let's continue and regenerate
 
-            # Double-check if missing_observers is still reporting this role
-            sessions = get_unanalyzed_sessions(db_path, [role_name])
-            still_missing = False
-            for session in sessions:
-                if (
-                    session["id"] == session_id
-                    and role_name in session["missing_observers"]
-                ):
-                    still_missing = True
-
-            if still_missing:
-                logger.warning(
-                    f"Role {role_name} is still reported as missing after processing!"
-                )
-        else:
-            logger.error(f"Failed to create {role_name} notes for session {session_id}")
-
-    logger.info(f"Completed analysis for session {session_id}, results: {results}")
-    return results
-
-
-def get_unanalyzed_sessions(
-    db_path: str, observer_names: List[str] = None
-) -> List[Dict[str, Any]]:
-    """
-    Find sessions that haven't been analyzed by specified experts.
-    """
-
-    logger.info(f"Checking sessions for observers: {', '.join(observer_names)}")
-
-    try:
-        conn, cursor = get_connection(db_path)
-
-        # Get all sessions
-        cursor.execute(
-            """
-            SELECT id, title, created_at
-            FROM sessions
-            ORDER BY created_at DESC
-        """
-        )
-
-        sessions = [dict(row) for row in cursor.fetchall()]
-        logger.debug(f"Found {len(sessions)} sessions in database")
-
-        # For each session, check which experts have analyzed it
-        incomplete_sessions = 0
-
-        for session in sessions:
-            session_id = session["id"]
-            session["missing_observers"] = []
-
-            logger.debug(f"Checking session {session_id}: {session['title']}")
-
-            # First check distinct authors that have analyzed this session
-            cursor.execute(
-                """
-                SELECT DISTINCT author 
-                FROM knowledge_records
-                WHERE session_id = ?
-            """,
-                (session_id,),
-            )
-
-            existing_authors = [row[0] for row in cursor.fetchall()]
+        try:
+            # Get session data
+            logger.debug(f"Retrieving session data for {session_id}")
+            session, qa_pairs = get_session_data(DB_PATH, session_id)
             logger.debug(
-                f"Session {session_id} has been analyzed by: {', '.join(existing_authors or ['none'])}"
+                f"Session data retrieved: {session['title']}, {len(qa_pairs)} QA pairs"
             )
 
-            for role_name in observer_names:
-                # Check if this expert has analyzed this session
-                cursor.execute(
-                    """
-                    SELECT COUNT(*) FROM knowledge_records
-                    WHERE session_id = ? AND author = ?
-                """,
-                    (session_id, role_name),
-                )
+            # Create input data
+            input_content = create_session_context(session, qa_pairs)
+            logger.debug(f"Created session context, length: {len(input_content)}")
 
-                count = cursor.fetchone()[0]
-                if count == 0:
-                    session["missing_observers"].append(role_name)
-                    logger.debug(
-                        f"Session {session_id} is missing observer: {role_name}"
-                    )
-                else:
-                    logger.debug(
-                        f"Session {session_id} has {count} records from {role_name}"
-                    )
+            # Get role prompt
+            role_prompt = get_role_prompt(self.config, role_name, "Observer")
+            logger.debug(
+                f"Retrieved role prompt for {role_name}, length: {len(role_prompt)}"
+            )
 
-            # Add a complete flag, if a session has no missing observers
-            session["is_complete"] = len(session["missing_observers"]) == 0
+            # Use centralized LLM calling
+            logger.info(f"Calling LLM for {role_name} analysis on session {session_id}")
+            response = llm_process_with_prompt(self.config,
+                input_content=input_content,
+                prompt=role_prompt,
+                model=MODEL_NAME,
+                expect_json=True,
+            )
 
-            if not session["is_complete"]:
-                incomplete_sessions += 1
+            # Check response type
+            logger.debug(f"LLM response type: {type(response)}")
+            if isinstance(response, list):
+                logger.debug(f"Response is a list with {len(response)} items")
+            elif isinstance(response, dict):
                 logger.debug(
-                    f"Session {session_id} is incomplete, missing: {', '.join(session['missing_observers'])}"
+                    f"Response is a dictionary with keys: {', '.join(response.keys())}"
                 )
             else:
-                logger.debug(f"Session {session_id} is complete")
+                logger.debug(f"Response is of unexpected type: {type(response)}")
+
+            # Handle response format
+            observations = response if isinstance(response, list) else [response]
+            logger.debug(f"Extracted {len(observations)} observations")
+
+            # Store notes in the database
+            conn, cursor = get_connection(DB_PATH)
+
+            timestamp = datetime.utcnow().isoformat()
+            note_ids = []
+
+            logger.info(f"Storing {len(observations)} observations for {role_name}")
+
+            # Process each observation individually
+            for idx, obs in enumerate(observations):
+                logger.debug(f"Processing observation {idx+1}/{len(observations)}")
+
+                observation_text = obs.get("observation")
+                if not observation_text:
+                    logger.warning(f"Observation {idx+1} missing 'observation' field")
+                    continue
+
+                embedding = get_embedding(self.config,observation_text)
+                embedding_bytes = embedding.tobytes()
+
+                # Generate unique note ID for each observation
+                note_id = generate_id("note", session_id, role_name)
+                logger.debug(f"Generated note ID: {note_id}")
+
+                # Store the knowledge record
+                try:
+                    self.store_knowledge_record(
+                        cursor=cursor,
+                        note_id=note_id,
+                        record_type="note",
+                        author=role_name,
+                        content=obs,
+                        timestamp=timestamp,
+                        embedding_bytes=embedding_bytes,
+                        session_id=session_id,
+                        model=MODEL_NAME,
+                    )
+                    note_ids.append(note_id)
+                    logger.debug(f"Stored knowledge record: {note_id}")
+
+                    # Commit after each record
+                    conn.commit()
+                    logger.debug(f"Committed record {note_id} to database")
+                except Exception as e:
+                    logger.error(f"Error storing record {note_id}: {str(e)}")
+                    # Continue with other observations
+
+            # Final database verification
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
+                (session_id, role_name),
+            )
+            final_count = cursor.fetchone()[0]
+            logger.info(
+                f"Final database count for {role_name} on session {session_id}: {final_count} records"
+            )
+
+            conn.close()
+
+            return note_ids
+
+        except Exception as e:
+            logger.error(f"Error in run_role_analysis: {str(e)}", exc_info=True)
+            return None
+
+
+    def run_multiple_role_analyses(self,session_id: str, role_names: List[str] ) -> Dict[str, int]:
+        """
+        Run multiple expert analyses on a session.
+        """
+        DB_PATH=self.config.database.path
+
 
         logger.info(
-            f"Found {incomplete_sessions} incomplete sessions out of {len(sessions)}"
+            f"Starting analysis for session {session_id} with {len(role_names)} roles"
         )
-        conn.close()
-        return sessions
+        # Debug log the roles we're about to process
+        logger.debug(f"Will process these roles: {', '.join(role_names)}")
 
-    except sqlite3.Error as e:
-        logger.error(f"Error finding unanalyzed sessions: {str(e)}")
-        return []
+        # Check if session exists before processing
+        conn, cursor = get_connection(DB_PATH)
+        cursor.execute("SELECT id, title FROM sessions WHERE id = ?", (session_id,))
+        session_info = cursor.fetchone()
+        if not session_info:
+            logger.error(f"Session {session_id} not found in database")
+            conn.close()
+            return {}
+        logger.debug(f"Found session: {session_info['title']} ({session_id})")
+
+        # Check which roles have already been processed
+        all_processed = True
+        for role_name in role_names:
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
+                (session_id, role_name),
+            )
+            count = cursor.fetchone()[0]
+            if count > 0:
+                logger.debug(
+                    f"Role {role_name} already has {count} records for session {session_id}"
+                )
+            else:
+                all_processed = False
+                logger.debug(f"Role {role_name} needs processing for session {session_id}")
+
+        if all_processed:
+            logger.info(f"All roles already processed for session {session_id}")
+            conn.close()
+            return {role: 0 for role in role_names}
+
+        conn.close()
+
+        results = {}
+        for role_name in role_names:
+            logger.info(f"Processing role: {role_name} for session {session_id}")
+
+            # Check if this role already has records
+            conn, cursor = get_connection(DB_PATH)
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
+                (session_id, role_name),
+            )
+            existing_count = cursor.fetchone()[0]
+            conn.close()
+
+            if existing_count > 0:
+                logger.info(f"Skipping {role_name} - already has {existing_count} records")
+                results[role_name] = existing_count
+                continue
+
+            note_ids = self.run_role_analysis(session_id, role_name)
+
+            # Verify results were stored
+            conn, cursor = get_connection(DB_PATH)
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
+                (session_id, role_name),
+            )
+            new_count = cursor.fetchone()[0]
+            conn.close()
+
+            if note_ids:
+                results[role_name] = len(note_ids)
+                logger.info(
+                    f"Created {len(note_ids)} {role_name} notes for session {session_id}"
+                )
+                logger.debug(f"Database now shows {new_count} records for {role_name}")
+
+                # Double-check if missing_observers is still reporting this role
+                sessions = self.get_unanalyzed_sessions(DB_PATH, [role_name])
+                still_missing = False
+                for session in sessions:
+                    if (
+                        session["id"] == session_id
+                        and role_name in session["missing_observers"]
+                    ):
+                        still_missing = True
+
+                if still_missing:
+                    logger.warning(
+                        f"Role {role_name} is still reported as missing after processing!"
+                    )
+            else:
+                logger.error(f"Failed to create {role_name} notes for session {session_id}")
+
+        logger.info(f"Completed analysis for session {session_id}, results: {results}")
+        return results
+
+
+    def get_unanalyzed_sessions(self,
+        observer_names: List[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Find sessions that haven't been analyzed by specified experts.
+        """
+        DB_PATH=self.config.database.path
+        logger.info(f"Checking sessions for observers: {', '.join(observer_names)}")
+
+        try:
+            conn, cursor = get_connection(DB_PATH)
+
+            # Get all sessions
+            cursor.execute(
+                """
+                SELECT id, title, created_at
+                FROM sessions
+                ORDER BY created_at DESC
+            """
+            )
+
+            sessions = [dict(row) for row in cursor.fetchall()]
+            logger.debug(f"Found {len(sessions)} sessions in database")
+
+            # For each session, check which experts have analyzed it
+            incomplete_sessions = 0
+
+            for session in sessions:
+                session_id = session["id"]
+                session["missing_observers"] = []
+
+                logger.debug(f"Checking session {session_id}: {session['title']}")
+
+                # First check distinct authors that have analyzed this session
+                cursor.execute(
+                    """
+                    SELECT DISTINCT author 
+                    FROM knowledge_records
+                    WHERE session_id = ?
+                """,
+                    (session_id,),
+                )
+
+                existing_authors = [row[0] for row in cursor.fetchall()]
+                logger.debug(
+                    f"Session {session_id} has been analyzed by: {', '.join(existing_authors or ['none'])}"
+                )
+
+                for role_name in observer_names:
+                    # Check if this expert has analyzed this session
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) FROM knowledge_records
+                        WHERE session_id = ? AND author = ?
+                    """,
+                        (session_id, role_name),
+                    )
+
+                    count = cursor.fetchone()[0]
+                    if count == 0:
+                        session["missing_observers"].append(role_name)
+                        logger.debug(
+                            f"Session {session_id} is missing observer: {role_name}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Session {session_id} has {count} records from {role_name}"
+                        )
+
+                # Add a complete flag, if a session has no missing observers
+                session["is_complete"] = len(session["missing_observers"]) == 0
+
+                if not session["is_complete"]:
+                    incomplete_sessions += 1
+                    logger.debug(
+                        f"Session {session_id} is incomplete, missing: {', '.join(session['missing_observers'])}"
+                    )
+                else:
+                    logger.debug(f"Session {session_id} is complete")
+
+            logger.info(
+                f"Found {incomplete_sessions} incomplete sessions out of {len(sessions)}"
+            )
+            conn.close()
+            return sessions
+
+        except sqlite3.Error as e:
+            logger.error(f"Error finding unanalyzed sessions: {str(e)}")
+            return []
 
 
 
@@ -571,7 +533,7 @@ def process_document(
                     note_id = generate_id("note", session_id, expert, str(note_count))
 
                     # Store the knowledge record
-                    store_knowledge_record(
+                    self.store_knowledge_record(
                         cursor=cursor,
                         note_id=note_id,
                         record_type="note",
