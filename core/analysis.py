@@ -19,7 +19,7 @@ from .config import ConfigSchema
 from .utils import generate_id, extract_json
 from .ingest import get_session_data, create_session_context
 from .embedding import get_embedding
-from .llm_calling import llm_process_with_prompt, get_role_prompt
+from .llm_calling import llm_process_with_prompt, get_role_prompt, extract_keywords
 from .database import get_connection
 
 # Set up logging
@@ -30,52 +30,55 @@ class AnalysisManager:
     def __init__(self, config:ConfigSchema):
         self.config = config
 
-    def extract_keywords(self, content: str) -> List[str]:
-        """
-        Extract keywords from text using the KeywordExtractor role.
-        """
+    # moved to llm_calling.py
+    #
+    #
+    # def extract_keywords(self, content: str) -> List[str]:
+    #     """
+    #     Extract keywords from text using the KeywordExtractor role.
+    #     """
 
-        MODEL_NAME=self.config.llm.generative_model
+    #     MODEL_NAME=self.config.llm.generative_model
 
-        # Type safety check
-        if not isinstance(content, str) or not content:
-            logger.warning(
-                f"extract_keywords received non-string or empty content: {type(content)}"
-            )
-            return []
+    #     # Type safety check
+    #     if not isinstance(content, str) or not content:
+    #         logger.warning(
+    #             f"extract_keywords received non-string or empty content: {type(content)}"
+    #         )
+    #         return []
 
-        # Get role path
-        role_prompt = get_role_prompt(self.config,"KeywordExtractor", "Helper")
+    #     # Get role path
+    #     role_prompt = get_role_prompt(self.config,"KeywordExtractor", "Helper")
 
-        try:
-            # Use centralized LLM calling
-            result = llm_process_with_prompt(self.config,
-                input_content=content, prompt=role_prompt, model=MODEL_NAME, expect_json=True
-            )
+    #     try:
+    #         # Use centralized LLM calling
+    #         result = llm_process_with_prompt(self.config,
+    #             input_content=content, prompt=role_prompt, model=MODEL_NAME, expect_json=True
+    #         )
 
-            # Make sure result is a dictionary before trying to extract keywords
-            if isinstance(result, dict) and "keywords" in result:
-                keywords_str = result["keywords"]
-            else:
-                # Try to extract keywords from the result
-                try:
-                    parsed_result = extract_json(result)
-                    keywords_str = parsed_result.get("keywords", "")
-                except Exception as e:
-                    logger.error(f"Failed to extract keywords JSON: {str(e)}")
-                    return []
+    #         # Make sure result is a dictionary before trying to extract keywords
+    #         if isinstance(result, dict) and "keywords" in result:
+    #             keywords_str = result["keywords"]
+    #         else:
+    #             # Try to extract keywords from the result
+    #             try:
+    #                 parsed_result = extract_json(result)
+    #                 keywords_str = parsed_result.get("keywords", "")
+    #             except Exception as e:
+    #                 logger.error(f"Failed to extract keywords JSON: {str(e)}")
+    #                 return []
 
-            # Process the comma-separated output
-            if isinstance(keywords_str, str):
-                keywords = [kw.strip() for kw in keywords_str.split(",")]
-                return [kw for kw in keywords if kw]  # Filter out empty strings
-            else:
-                logger.warning(f"Expected string for keywords, got {type(keywords_str)}")
-                return []
+    #         # Process the comma-separated output
+    #         if isinstance(keywords_str, str):
+    #             keywords = [kw.strip() for kw in keywords_str.split(",")]
+    #             return [kw for kw in keywords if kw]  # Filter out empty strings
+    #         else:
+    #             logger.warning(f"Expected string for keywords, got {type(keywords_str)}")
+    #             return []
 
-        except Exception as e:
-            logger.error(f"Error in keyword extraction: {str(e)}")
-            return []
+    #     except Exception as e:
+    #         logger.error(f"Error in keyword extraction: {str(e)}")
+    #         return []
 
 
     def store_knowledge_record(self,
@@ -88,7 +91,8 @@ class AnalysisManager:
         embedding_bytes: bytes,
         session_id: Optional[str] = None,
         qa_id: Optional[str] = None,
-        source_id: Optional[str] = None
+        source_id: Optional[str] = None,
+        keywords: Optional[List[str]] = None,
     ) -> None:
         """
         Store a knowledge record with keywords.
@@ -96,12 +100,14 @@ class AnalysisManager:
 
         MODEL_NAME=self.config.llm.generative_model
 
-        # Extract keywords from the observation text
-        observation_text = content.get("observation", content.get("content", ""))
+        # # Extract keywords from the observation text
+        # observation_text = content.get("observation", content.get("content", ""))
 
-        # Now extract keywords from the string
-        keywords = self.extract_keywords(observation_text)
-        logger.info(f"keywords : {keywords}")
+        # # Now extract keywords from the string
+        # keywords = self.extract_keywords(observation_text)
+        # logger.info(f"keywords : {keywords}")
+
+
 
         # Store as knowledge record
         cursor.execute(
@@ -210,6 +216,7 @@ class AnalysisManager:
                 if not observation_text:
                     logger.warning(f"Observation {idx+1} missing 'observation' field")
                     continue
+                logger.info(observation_text)
 
                 embedding = get_embedding(self.config,observation_text)
                 embedding_bytes = embedding.tobytes()
@@ -218,27 +225,36 @@ class AnalysisManager:
                 note_id = generate_id("note", session_id, role_name)
                 logger.debug(f"Generated note ID: {note_id}")
 
-                # Store the knowledge record
-                try:
-                    self.store_knowledge_record(
-                        cursor=cursor,
-                        note_id=note_id,
-                        record_type="note",
-                        author=role_name,
-                        content=obs,
-                        timestamp=timestamp,
-                        embedding_bytes=embedding_bytes,
-                        session_id=session_id,
-                    )
-                    note_ids.append(note_id)
-                    logger.debug(f"Stored knowledge record: {note_id}")
+                # # Extract keywords from the observation text
+                # observation_text = obs.get("observation", content.get("content", ""))
 
-                    # Commit after each record
-                    conn.commit()
-                    logger.debug(f"Committed record {note_id} to database")
-                except Exception as e:
-                    logger.error(f"Error storing record {note_id}: {str(e)}")
-                    # Continue with other observations
+                # Now extract keywords from the string
+                keywords = extract_keywords(observation_text)
+                logger.info(f"keywords : {keywords}")                
+
+                if not self.config.dryrun:
+                    # Store the knowledge record
+                    try:
+                        self.store_knowledge_record(
+                            cursor=cursor,
+                            note_id=note_id,
+                            record_type="note",
+                            author=role_name,
+                            content=obs,
+                            timestamp=timestamp,
+                            embedding_bytes=embedding_bytes,
+                            session_id=session_id,
+                            keywords=keywords,
+                        )
+                        note_ids.append(note_id)
+                        logger.debug(f"Stored knowledge record: {note_id}")
+
+                        # Commit after each record
+                        conn.commit()
+                        logger.debug(f"Committed record {note_id} to database")
+                    except Exception as e:
+                        logger.error(f"Error storing record {note_id}: {str(e)}")
+                        # Continue with other observations
 
             # Final database verification
             cursor.execute(
@@ -250,6 +266,7 @@ class AnalysisManager:
                 f"Final database count for {role_name} on session {session_id}: {final_count} records"
             )
 
+            cursor.close()
             conn.close()
 
             return note_ids

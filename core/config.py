@@ -47,6 +47,7 @@ class Logging(BaseModel):
     file: str
 
 class ConfigSchema(BaseModel):
+    dryrun: bool = False
     database: Database
     llm: LLM
     roles: Roles

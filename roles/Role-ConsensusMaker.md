@@ -12,21 +12,12 @@ Your task is to synthesize clusters of observations into consensus statements.
 5. Set confidence based on source confidence levels and expert agreement
 
 # OUTPUT FORMAT
-You MUST output ONLY a JSON array of consensus objects. Nothing else, no metadata:
-[
-  {
-    "observation": "Your synthesized observation for cluster 1",
-    "life_stage": "Inherit from cluster notes",
-    "confidence": "Your assessed confidence",
-    "source_records": ["id1", "id2", "id3"]
-  },
-  {
-    "observation": "Your synthesized observation for cluster 1",
-    "life_stage": "Inherit from cluster notes",
-    "confidence": "Your assessed confidence",
-    "source_records": ["id1", "id2", "id3"]
-  },
-]
+You MUST output ONLY a JSON object. Nothing else, no metadata, no preamble:
+{
+  "observation": "Your synthesized observation",
+  "life_stage": "Inherit from cluster notes",
+  "confidence": "Your assessed confidence",
+  "source_records": ["id1", "id2", "id3"]
+}
 
 #INPUT
-Subjects current Life Stage is : LATE_CAREER

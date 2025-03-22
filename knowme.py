@@ -101,6 +101,7 @@ def init(ctx, db_path: Optional[str]):
 @click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
 @click.option("--sessions", is_flag=True, help="Analyze sessions only")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
+@click.option("--dryrun", is_flag=True, help="Dry run mode")
 @click.pass_context
 def analyze(ctx,
     db_path: Optional[str],
@@ -108,6 +109,7 @@ def analyze(ctx,
     queue: bool,
     sessions: bool,
     model: Optional[str],
+    dryrun: bool,
 ):
     """
     Run expert analysis on content.
@@ -127,6 +129,8 @@ def analyze(ctx,
         config.llm.generative_model = model
         console.print(f"[blue]Overriding LLM model: {model}[/blue]")
 
+    if dryrun:
+        config.dryrun = True
 
     analysis_manager = AnalysisManager(config)
 
@@ -220,9 +224,7 @@ def analyze(ctx,
 @cli.command()
 @click.option("--threshold", "-t", default=0.85, help="Similarity threshold (0-1)")
 @click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option(
-    "--dryrun", is_flag=True, help="Show what would be merged without making changes"
-)
+@click.option("--dryrun", "dryrun",is_flag=True, help="Dry run mode")
 @click.option(
     "--type",
     "kr_type",
@@ -258,24 +260,15 @@ def merge(ctx,
         config.llm.generative_model = model
         console.print(f"[blue]Overriding LLM model: {model}[/blue]")
 
+    if dryrun:
+        config.dryrun = True
+
     # Initialize the consensus manager
     consensus_manager = ConsensusManager(config)
 
     if list:
         # Just list clusters without creating consensus
-        console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
 
-        result = consensus_manager.list_clusters(threshold, kr_type=kr_type)
-
-        if not result["clusters"]:
-            console.print(
-                "[yellow]No clusters found with the current threshold.[/yellow]"
-            )
-            return
-
-        console.print(
-            f"[green]Found {result['cluster_count']} clusters containing {result['record_count']} observations[/green]"
-        )
 
         # Create a table to display clusters
         table = Table(title=f"Observation Clusters (threshold={threshold})")
@@ -312,7 +305,7 @@ def merge(ctx,
 
     try:
         result = consensus_manager.process_clusters(
-            threshold=threshold, kr_type=kr_type, model=model, dryrun=dryrun
+            threshold=threshold, kr_type=kr_type
         )
 
         if not result["clusters"]:

@@ -5,9 +5,11 @@ Module-specific database operations should remain in their respective modules.
 """
 import logging
 import os
+import json
 import sqlite3
 from pathlib import Path
-from typing import Optional
+from typing import Dict, List, Optional, Tuple, Any, Union
+
 
 from .config import ConfigSchema
 
@@ -82,3 +84,72 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
         return conn, cursor
     except sqlite3.Error as e:    
         raise sqlite3.Error(f"Error connecting to database: {str(e)}")
+
+def store_knowledge_record(config : ConfigSchema,
+    note_id: str,
+    record_type: str,
+    author: str,
+    content: Dict[str, Any],
+    timestamp: str,
+    embedding_bytes: bytes,
+    session_id: Optional[str] = None,
+    qa_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    keywords: Optional[List[str]] = None,
+) -> None:
+    """
+    Store a knowledge record with keywords.
+    """
+    DB_PATH=config.database.path
+
+    MODEL_NAME=config.llm.generative_model
+
+        # CREATE TABLE knowledge_records (
+        #     id TEXT PRIMARY KEY,
+        #     type TEXT,
+        #     domain TEXT,
+        #     author TEXT,
+        #     content JSON,
+        #     created_at TEXT,
+        #     version TEXT,
+        #     embedding BLOB,
+        #     consensus_id TEXT,
+        #     session_id TEXT NULL,
+        #     qa_id TEXT NULL,
+        #     source_id TEXT NULL,
+        #     keywords TEXT,
+        #     FOREIGN KEY (qa_id) REFERENCES qa_pairs(id),
+        #     FOREIGN KEY (session_id) REFERENCES sessions(id),
+        #     FOREIGN KEY (source_id) REFERENCES sources(id)
+        # );
+
+
+
+    # Get database connection
+    conn, cursor = get_connection(DB_PATH)
+
+    # Store as knowledge record
+    cursor.execute(
+        """
+        INSERT INTO knowledge_records
+        (id, type, author, content, created_at, 
+        embedding, session_id, qa_id, source_id, keywords)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            note_id,
+            record_type,
+            author,
+            json.dumps(content),
+            timestamp,
+            embedding_bytes,
+            session_id,
+            qa_id,
+            source_id,
+            ",".join(keywords) if keywords else None,
+        ),
+    )
+
+    conn.commit()
+    logger.info(f"Successfully stored knowledge record: {note_id}")
+    conn.close()

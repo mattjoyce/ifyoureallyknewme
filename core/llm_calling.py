@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional, Union
 import llm
 
 from .config import ConfigSchema
+from .utils import extract_json
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -194,3 +195,51 @@ def replace_token_with_file_contents(content, token, file_path):
 def get_embedding(config:ConfigSchema, text: str, model: Optional[str] = None) -> any:
     embedding_model=llm.get_embedding_model(model or config.llm.embedding_model)
     vector = embedding_model.embed(text)
+    return vector
+
+def extract_keywords(config, content: str) -> List[str]:
+    """
+    Extract keywords from text using the KeywordExtractor role.
+    """
+
+    MODEL_NAME=config.llm.generative_model
+
+    # Type safety check
+    if not isinstance(content, str) or not content:
+        logger.warning(
+            f"extract_keywords received non-string or empty content: {type(content)}"
+        )
+        return []
+
+    # Get role path
+    role_prompt = get_role_prompt(config,"KeywordExtractor", "Helper")
+
+    try:
+        # Use centralized LLM calling
+        result = llm_process_with_prompt(config,
+            input_content=content, prompt=role_prompt, model=MODEL_NAME, expect_json=True
+        )
+
+        # Make sure result is a dictionary before trying to extract keywords
+        if isinstance(result, dict) and "keywords" in result:
+            keywords_str = result["keywords"]
+        else:
+            # Try to extract keywords from the result
+            try:
+                parsed_result = extract_json(result)
+                keywords_str = parsed_result.get("keywords", "")
+            except Exception as e:
+                logger.error(f"Failed to extract keywords JSON: {str(e)}")
+                return []
+
+        # Process the comma-separated output
+        if isinstance(keywords_str, str):
+            keywords = [kw.strip() for kw in keywords_str.split(",")]
+            return [kw for kw in keywords if kw]  # Filter out empty strings
+        else:
+            logger.warning(f"Expected string for keywords, got {type(keywords_str)}")
+            return []
+
+    except Exception as e:
+        logger.error(f"Error in keyword extraction: {str(e)}")
+        return []
