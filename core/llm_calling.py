@@ -34,7 +34,7 @@ def call_llm_with_prompt(
     else:
         input_str = str(input_content)
     
-    logger.debug(f"Calling LLM with model: {model}")
+    logger.debug(f"Calling LLM with model: {model_name}")
 
     model = llm.get_model(model_name or"gpt-4o-mini")
     context=f"{prompt} \n\n {input_str}"

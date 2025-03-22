@@ -100,7 +100,7 @@ class AnalysisManager:
         observation_text = content.get("observation", content.get("content", ""))
 
         # Now extract keywords from the string
-        keywords = self.extract_keywords(self.config, observation_text, MODEL_NAME)
+        keywords = self.extract_keywords(observation_text)
         logger.info(f"keywords : {keywords}")
 
         # Store as knowledge record
@@ -150,8 +150,7 @@ class AnalysisManager:
             logger.info(
                 f"Analysis for {role_name} on session {session_id} already exists with {existing_count} records"
             )
-            # Do you want to return existing records or regenerate?
-            # For debugging, let's continue and regenerate
+            return None
 
         try:
             # Get session data
@@ -230,7 +229,6 @@ class AnalysisManager:
                         timestamp=timestamp,
                         embedding_bytes=embedding_bytes,
                         session_id=session_id,
-                        model=MODEL_NAME,
                     )
                     note_ids.append(note_id)
                     logger.debug(f"Stored knowledge record: {note_id}")
@@ -344,7 +342,7 @@ class AnalysisManager:
                 logger.debug(f"Database now shows {new_count} records for {role_name}")
 
                 # Double-check if missing_observers is still reporting this role
-                sessions = self.get_unanalyzed_sessions(DB_PATH, [role_name])
+                sessions = self.get_unanalyzed_sessions([role_name])
                 still_missing = False
                 for session in sessions:
                     if (

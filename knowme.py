@@ -85,7 +85,7 @@ def init(ctx, db_path: Optional[str]):
         console.print(f"[yellow]Warning: Database {db_path} already exists[/yellow]")
         return
 
-    success = create_database(config.database.path)
+    success = create_database(config, config.database.path)
     if not success:
         console.print(f"[red]Error creating database at {db_path}[/red]")
         return
@@ -94,7 +94,7 @@ def init(ctx, db_path: Optional[str]):
 
 
 @cli.command()
-@click.argument("db_path", type=click.Path(exists=True), required=False)
+@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
 @click.option(
     "--list", "-l", is_flag=True, help="List sessions/notes that need analysis"
 )
@@ -122,17 +122,10 @@ def analyze(ctx,
         config.database.path = db_path
         console.print(f"[blue]Overriding database path: {db_path}[/blue]")
     
+    
     if model:
         config.llm.generative_model = model
         console.print(f"[blue]Overriding LLM model: {model}[/blue]")
-
-    if not db_path:
-        console.print(
-            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
-        )
-        return
-
-
 
 
     analysis_manager = AnalysisManager(config)
@@ -176,8 +169,6 @@ def analyze(ctx,
                     results = analysis_manager.run_multiple_role_analyses(
                         session["id"],
                         session["missing_observers"],
-                        config.roles.schema_file,
-                        model,
                     )
 
                     # Display results
@@ -227,15 +218,15 @@ def analyze(ctx,
 
 
 @cli.command()
-@click.argument("db_path", type=click.Path(exists=True), required=False)
 @click.option("--threshold", "-t", default=0.85, help="Similarity threshold (0-1)")
+@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
 @click.option(
     "--dryrun", is_flag=True, help="Show what would be merged without making changes"
 )
 @click.option(
     "--type",
-    "-T",
-    kr_type=click.Choice(["note", "fact"], case_sensitive=False),
+    "kr_type",
+    type=click.Choice(["note", "fact"], case_sensitive=False),
     default="note",
     help="Type of records to merge",
 )
@@ -266,12 +257,6 @@ def merge(ctx,
     if model:
         config.llm.generative_model = model
         console.print(f"[blue]Overriding LLM model: {model}[/blue]")
-
-    if not db_path:
-        console.print(
-            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
-        )
-        return
 
     # Initialize the consensus manager
     consensus_manager = ConsensusManager(config)
@@ -422,8 +407,8 @@ def profile(ctx,
 
 
 @cli.command()
-@click.argument("db_path", type=click.Path(exists=True), required=False)
 @click.argument("file_patterns", nargs=-1, type=click.Path())
+@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
 @click.option(
     "--name", "-n", help="Name template for the content (use {index} for batch)"
 )
@@ -457,6 +442,7 @@ def profile(ctx,
 @click.option(
     "--dryrun", is_flag=True, help="Show what would be queued without making changes"
 )
+@click.pass_context
 def queue(ctx,
     db_path: Optional[str],
     file_patterns: tuple,
@@ -466,7 +452,7 @@ def queue(ctx,
     type: Optional[str],
     qa: bool,
     list: bool,
-    dry_run: bool,
+    dryrun: bool,
 ):
     """
     Add content to the analysis queue or process QA transcripts.
@@ -491,12 +477,6 @@ def queue(ctx,
         config.database.path = db_path
         console.print(f"[blue]Overriding database path: {db_path}[/blue]")
     
-    if not db_path:
-        console.print(
-            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
-        )
-        return
-
     # List mode is dominant mode. If --list is provided, ignore other options.
 
     ## ANALYSIS QUEUE tabel is for documents not sessions
@@ -571,7 +551,7 @@ def queue(ctx,
         console.print("[yellow]No files matched the provided patterns[/yellow]")
         return
 
-    if dry_run:
+    if dryrun:
         table = Table(title="Matched Files")
         table.add_column("Index", style="cyan")
         table.add_column("Path", style="green")
