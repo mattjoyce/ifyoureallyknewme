@@ -93,74 +93,48 @@ class ConsensusManager:
         finally:
             conn.close()
 
-    def detect_similar_consensus(self, similarity_threshold: float = 0.92) -> List[Dict[str, Any]]:
-        """Find pairs of consensus records that are too similar to each other.
+    def find_similar_consensus(self, threshold: float = 0.92) -> Dict[str, Any]:
+        """Find clusters of similar consensus records that should be reconsidered.
         
         Args:
-            similarity_threshold: Similarity threshold above which consensus records are considered duplicates
-            
+            threshold: Similarity threshold (0-1) - higher than normal clustering
+                
         Returns:
-            List of dictionaries with information about similar consensus pairs
+            Dictionary of clusters with metadata
         """
-        DB_PATH = self.config.database.path
-        conn, cursor = get_connection(DB_PATH)
+        # Use the existing find_clusters method but specify consensus type
+        consensus_clusters = self.find_clusters(threshold, record_type="consensus")
         
-        try:
-            # Get all consensus records
-            cursor.execute("""
-                SELECT id, content, embedding 
-                FROM knowledge_records 
-                WHERE type = 'consensus' AND embedding IS NOT NULL
-            """)
-            
-            records = []
-            for id, content_json, embedding_blob in cursor.fetchall():
-                if embedding_blob:
-                    embedding = np.frombuffer(embedding_blob, dtype=np.float32)
-                    content = json.loads(content_json)
-                    records.append({
-                        "id": id,
-                        "observation": content["observation"],
-                        "embedding": embedding
-                    })
-            
-            # If fewer than 2 records, no comparisons needed
-            if len(records) < 2:
-                return []
-            
-            # Compute pairwise similarities
-            similar_pairs = []
-            for i in range(len(records)):
-                for j in range(i+1, len(records)):
-                    # Compute cosine similarity between embeddings
-                    similarity = np.dot(records[i]["embedding"], records[j]["embedding"]) / (
-                        np.linalg.norm(records[i]["embedding"]) * np.linalg.norm(records[j]["embedding"])
-                    )
-                    
-                    if similarity > similarity_threshold:
-                        similar_pairs.append({
-                            "consensus1_id": records[i]["id"],
-                            "consensus2_id": records[j]["id"],
-                            "similarity": float(similarity),
-                            "observation1": records[i]["observation"],
-                            "observation2": records[j]["observation"]
-                        })
-            
-            return similar_pairs
+        if not consensus_clusters:
+            return {}
         
-        finally:
-            conn.close()
+        # Process each cluster to collect IDs of consensus records to reset
+        records_to_reset = {}
+        
+        for cluster_id, cluster in consensus_clusters.items():
+            if len(cluster["notes"]) > 1:  # Only consider clusters with multiple consensus records
+                # Collect IDs and related details
+                consensus_ids = [note["id"] for note in cluster["notes"]]
+                records_to_reset[cluster_id] = {
+                    "consensus_ids": consensus_ids,
+                    "observation_count": len(consensus_ids),
+                    "average_similarity": cluster["average_similarity"],
+                    "observations": [note["observation"] for note in cluster["notes"]]
+                }
+        
+        return records_to_reset
 
-    def reset_similar_consensus(self, pairs: List[Dict[str, Any]]) -> int:
+
+    def reset_consensus_clusters(self, consensus_clusters: Dict[str, Any]) -> int:
         """Reset similar consensus records by unlinking their source records.
         
         Args:
-            pairs: List of similar consensus pairs from detect_similar_consensus()
+            consensus_clusters: Result of find_similar_consensus()
             
         Returns:
             Number of consensus records reset
         """
-        if not pairs:
+        if not consensus_clusters:
             return 0
         
         DB_PATH = self.config.database.path
@@ -168,38 +142,41 @@ class ConsensusManager:
         
         try:
             reset_count = 0
-            processed_ids = set()
             
-            for pair in pairs:
-                consensus1_id = pair["consensus1_id"]
-                consensus2_id = pair["consensus2_id"]
+            for cluster_id, cluster in consensus_clusters.items():
+                consensus_ids = cluster["consensus_ids"]
                 
-                # Skip if already processed
-                if consensus1_id in processed_ids or consensus2_id in processed_ids:
-                    continue
+                # Format for SQL query
+                id_placeholders = ','.join(['?'] * len(consensus_ids))
                 
-                # Reset consensus_id for all records linked to these consensus records
-                cursor.execute("""
-                    UPDATE knowledge_records
-                    SET consensus_id = NULL
-                    WHERE consensus_id IN (?, ?)
-                """, (consensus1_id, consensus2_id))
+                # First get all source records linked to these consensus records
+                cursor.execute(f"""
+                    SELECT id FROM knowledge_records
+                    WHERE consensus_id IN ({id_placeholders})
+                """, consensus_ids)
+                
+                source_ids = [row[0] for row in cursor.fetchall()]
+                logger.info(f"Found {len(source_ids)} source records linked to {len(consensus_ids)} consensus records")
+                
+                # Reset consensus_id for all linked records
+                if source_ids:
+                    cursor.execute(f"""
+                        UPDATE knowledge_records
+                        SET consensus_id = NULL
+                        WHERE id IN ({','.join(['?'] * len(source_ids))})
+                    """, source_ids)
                 
                 # Delete the consensus records
-                cursor.execute("""
+                cursor.execute(f"""
                     DELETE FROM knowledge_records
-                    WHERE id IN (?, ?)
-                """, (consensus1_id, consensus2_id))
+                    WHERE id IN ({id_placeholders})
+                """, consensus_ids)
                 
-                # Mark as processed
-                processed_ids.add(consensus1_id)
-                processed_ids.add(consensus2_id)
-                
-                reset_count += 2
+                reset_count += len(consensus_ids)
             
             conn.commit()
             return reset_count
-        
+            
         finally:
             conn.close()
 
@@ -328,7 +305,7 @@ class ConsensusManager:
             store_knowledge_record(
                 self.config,
                 note_id,
-                "note",
+                "consensus",
                 author,
                 consensus,
                 timestamp,

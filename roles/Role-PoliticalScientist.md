@@ -24,20 +24,14 @@ interview content or facts below.)
 
 {{schema}}
 
+# RULES
+1. Output ONLY the JSON array of objects
+2. No preamble, explanation, or metadata wrapper
+3. Set confidence based on evidence available
+4. Start your new observations with "The subject" or "The interviewee"
+5. Focus on creating clean, direct statements that will produce more effective embeddings.
 
 ## Output Format
-
-Important: When writing observations about the subject, start directly with the relevant action or attribute. 
-- Omit phrases like "The interviewee" or "The subject" since the context is already established.
-- Begin sentences with verbs, adjectives, or relevant nouns instead.
-- Focus on creating clean, direct statements that will produce more effective embeddings.
-
-EXAMPLES:
-Instead of: "The interviewee demonstrates strong analytical skills"
-Write: "Demonstrates strong analytical skills"
-
-Instead of: "The subject grew up in a rural environment" 
-Write: "Grew up in a rural environment"
 
 ** Observation Output Format **
 Records must be a JSON array of objects. Each object MUST have these four fields:

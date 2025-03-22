@@ -722,5 +722,95 @@ def queue(ctx,
         console.print(f"[red]Error queueing files: {str(e)}[/red]")
 
 
+@cli.command()
+@click.option("--threshold", "-t", default=0.92, help="Similarity threshold (0-1)")
+@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
+@click.option("--reset", "-r", is_flag=True, help="Reset similar consensus records")
+@click.option("--dryrun", is_flag=True, help="Show what would be reset without making changes")
+@click.option("--no-list", is_flag=True, help="Skip detailed listing of consensus records")
+@click.pass_context
+def consensus(ctx,
+    db_path: Optional[str],
+    threshold: float,
+    reset: bool,
+    dryrun: bool,
+    no_list: bool,
+):
+    """
+    Manage consensus records.
+    
+    Find similar consensus records that might need to be reset.
+    By default, shows a list of similar consensus record clusters.
+    
+    Use --reset to reset the similar consensus records, unlinking their
+    source records to allow re-clustering.
+    
+    Use --dryrun with --reset to see what would be reset without making changes.
+    
+    Use --no-list to skip the detailed listing (useful for scripts).
+    """
+    config = ctx.obj
+    if db_path:
+        config.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
+    
+    if dryrun:
+        config.dryrun = True
+    
+    consensus_manager = ConsensusManager(config)
+    
+    # Find similar consensus records
+    console.print(f"[blue]Finding similar consensus records with threshold {threshold}...[/blue]")
+    consensus_clusters = consensus_manager.find_similar_consensus(threshold)
+    
+    if not consensus_clusters:
+        console.print("[yellow]No similar consensus records found with the current threshold.[/yellow]")
+        return
+    
+    # Display results unless --no-list is specified
+    if not no_list:
+        table = Table(title=f"Similar Consensus Records (threshold={threshold})")
+        table.add_column("Cluster", style="cyan")
+        table.add_column("Count", style="green", justify="right")
+        table.add_column("Avg. Similarity", style="yellow", justify="right")
+        table.add_column("Records", style="magenta")
+        table.add_column("Sample Observation", style="white")
+        
+        total_records = 0
+        for cluster_id, cluster in consensus_clusters.items():
+            record_ids = ", ".join(cluster["consensus_ids"][:3]) 
+            if len(cluster["consensus_ids"]) > 3:
+                record_ids += f"... (+{len(cluster['consensus_ids']) - 3} more)"
+                
+            # Truncate sample observation if too long
+            sample = cluster["observations"][0]
+            if len(sample) > 60:
+                sample = sample[:57] + "..."
+                
+            table.add_row(
+                cluster_id,
+                str(cluster["observation_count"]),
+                f"{cluster['average_similarity']:.2f}",
+                record_ids,
+                sample
+            )
+            total_records += cluster["observation_count"]
+        
+        console.print(table)
+        console.print(f"[blue]Found {len(consensus_clusters)} clusters containing {total_records} consensus records[/blue]")
+    
+    # Reset if requested
+    if reset:
+        total_count = sum(c["observation_count"] for c in consensus_clusters.values())
+        
+        if dryrun:
+            console.print(f"[yellow]Would reset {total_count} consensus records in {len(consensus_clusters)} clusters[/yellow]")
+            # Show what would happen to each cluster
+            for cluster_id, cluster in consensus_clusters.items():
+                console.print(f"  - Cluster {cluster_id}: {cluster['observation_count']} records would be reset")
+        else:
+            reset_count = consensus_manager.reset_consensus_clusters(consensus_clusters)
+            console.print(f"[green]Reset {reset_count} consensus records[/green]")
+                
 if __name__ == "__main__":
     cli()
