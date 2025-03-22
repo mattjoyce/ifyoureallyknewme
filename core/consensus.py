@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class ConsensusManager:
     """Manager class for handling clustering and consensus operations."""
     
-    def __init__(self, config: ConfigSchema, db_path: Optional[str] = None):
+    def __init__(self, config: ConfigSchema):
         """Initialize ConsensusManager.
         
         Args:
@@ -35,9 +35,7 @@ class ConsensusManager:
             db_path: Path to the database. If None, uses the path from config.
         """
         self.config = config
-        self.db_path = db_path or config.database.path
-        if not self.db_path:
-            raise ValueError("No database path provided and not found in configuration")
+
     
     def load_records(self, record_type: str = "note") -> List[Dict[str, Any]]:
         """Load all records with embeddings that haven't been assigned to consensus yet.
@@ -48,7 +46,9 @@ class ConsensusManager:
         Returns:
             List of record dictionaries
         """
-        conn, cursor = get_connection(self.db_path)
+        DB_PATH = self.config.database.path
+
+        conn, cursor = get_connection(DB_PATH)
         
         try:
             query = """
@@ -191,12 +191,15 @@ class ConsensusManager:
         Returns:
             ID of the created consensus record
         """
+
+        DB_PATH = self.config.database.path
+
         # Generate timestamp if not provided
         if timestamp is None:
             timestamp = datetime.utcnow().isoformat()
         
         # Connect to database
-        conn, cursor = get_connection(self.db_path)
+        conn, cursor = get_connection(DB_PATH)
         
         try:
             # Serialize consensus and generate ID
@@ -236,18 +239,20 @@ class ConsensusManager:
             conn.close()
     
     def make_consensus(
-        self, cluster: dict, model: str = None, author: str = "ConsensusMaker"
+        self, cluster: dict, author: str = "ConsensusMaker"
     ) -> List[str]:
         """Generate consensus from a cluster using LLM and save to database.
         
         Args:
             cluster: Cluster dictionary 
-            model: Model name for LLM
             author: Author name for the consensus
             
         Returns:
             List of created consensus record IDs
         """
+
+        MODEL_NAME = self.config.llm.generative_model
+
         # Skip clusters with fewer than 2 notes
         if len(cluster["notes"]) < 2:
             logger.warning(f"Skipping cluster: Only {len(cluster['notes'])} notes")
@@ -260,7 +265,7 @@ class ConsensusManager:
             prompt= get_role_prompt(self.config, "ConsensusMaker", "Helper")
             
             # Process cluster with LLM
-            consensus_records = llm_process_with_prompt(self.config, cluster, prompt, model)
+            consensus_records = llm_process_with_prompt(self.config, cluster, prompt, MODEL_NAME)
             
             if isinstance(consensus_records, dict):
                 consensus_records = [consensus_records]
@@ -282,34 +287,36 @@ class ConsensusManager:
     def process_clusters(
         self, 
         threshold: float = 0.85, 
-        record_type: str = "note",
-        model: Optional[str] = None,
+        kr_type: str = "note",
         author: str = "ConsensusMaker",
-        whatif: bool = False
+        dryrun: bool = False
     ) -> Dict[str, Any]:
         """Find clusters and generate consensus in one operation.
         
         Args:
             threshold: Similarity threshold (0-1)
-            record_type: Type of records to cluster
+            kr_type: Type of records to cluster
             model: Model name for LLM
             author: Author name for consensus records
-            whatif: If True, don't save the consensus records
+            dryrun: If True, don't save the consensus records
             
         Returns:
             Dictionary with cluster and consensus information
         """
+
+        MODEL_NAME = self.config.llm.generative_model
+
         # Find clusters
-        clusters = self.find_clusters(threshold, record_type)
+        clusters = self.find_clusters(threshold, kr_type)
         
         if not clusters:
             return {"clusters": {}, "consensus_count": 0, "cluster_count": 0}
         
         # Process consensus if not in whatif mode
         consensus_ids = []
-        if not whatif:
+        if not dryrun:
             for cluster_id, cluster in clusters.items():
-                cluster_consensus_ids = self.make_consensus(cluster, model, author)
+                cluster_consensus_ids = self.make_consensus(cluster, MODEL_NAME, author)
                 consensus_ids.extend(cluster_consensus_ids)
                 
                 # Add consensus IDs to cluster data for reporting
@@ -324,7 +331,7 @@ class ConsensusManager:
     def list_clusters(
         self, 
         threshold: float = 0.85, 
-        record_type: str = "note"
+        kr_type: str = "note"
     ) -> Dict[str, Any]:
         """Find and list clusters without generating consensus.
         
@@ -335,7 +342,7 @@ class ConsensusManager:
         Returns:
             Dictionary with cluster information for display
         """
-        clusters = self.find_clusters(threshold, record_type)
+        clusters = self.find_clusters(threshold, kr_type)
         
         # Format and count for display
         result = {

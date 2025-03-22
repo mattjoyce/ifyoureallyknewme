@@ -230,22 +230,23 @@ def analyze(ctx,
 @click.argument("db_path", type=click.Path(exists=True), required=False)
 @click.option("--threshold", "-t", default=0.85, help="Similarity threshold (0-1)")
 @click.option(
-    "--whatif", is_flag=True, help="Show what would be merged without making changes"
+    "--dryrun", is_flag=True, help="Show what would be merged without making changes"
 )
 @click.option(
     "--type",
     "-T",
-    type=click.Choice(["notes", "facts"], case_sensitive=False),
-    default="notes",
+    kr_type=click.Choice(["note", "fact"], case_sensitive=False),
+    default="note",
     help="Type of records to merge",
 )
 @click.option("--list", "-l", is_flag=True, help="List clusters without merging")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
-def merge(
+@click.pass_context
+def merge(ctx,
     db_path: Optional[str],
     threshold: float,
-    whatif: bool,
-    type: str,
+    dryrun: bool,
+    kr_type: str,
     list: bool,
     model: Optional[str],
 ):
@@ -255,25 +256,31 @@ def merge(
     Uses semantic similarity to group related observations and create
     higher-level consensus statements.
     """
-    config = get_config()
-    db_path = db_path or config.database.path
+
+    config = ctx.obj
+    # Apply overrides if provided
+    if db_path:
+        config.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
+    
+    if model:
+        config.llm.generative_model = model
+        console.print(f"[blue]Overriding LLM model: {model}[/blue]")
+
     if not db_path:
         console.print(
-            "[red]Error: No database path provided and not found in configuration[/red]"
+            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
         )
         return
 
-    # Convert type to singular form for database query
-    record_type = "note" if type.lower() == "notes" else "fact"
-
     # Initialize the consensus manager
-    consensus_manager = ConsensusManager(config, db_path)
+    consensus_manager = ConsensusManager(config)
 
     if list:
         # Just list clusters without creating consensus
         console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
 
-        result = consensus_manager.list_clusters(threshold, record_type)
+        result = consensus_manager.list_clusters(threshold, kr_type=kr_type)
 
         if not result["clusters"]:
             console.print(
@@ -320,7 +327,7 @@ def merge(
 
     try:
         result = consensus_manager.process_clusters(
-            threshold=threshold, record_type=record_type, model=model, whatif=whatif
+            threshold=threshold, kr_type=kr_type, model=model, dryrun=dryrun
         )
 
         if not result["clusters"]:
@@ -329,12 +336,12 @@ def merge(
             )
             return
 
-        mode = "What-if" if whatif else "Actual"
-        console.print(
-            f"[green]{mode} merge complete with threshold {threshold}[/green]"
-        )
+        if not dryrun:
+            console.print(
+                f"[green] Actual merge complete with threshold {threshold}[/green]"
+            )
 
-        if whatif:
+        if dryrun:
             console.print(
                 f"Would create approximately {len(result['clusters'])} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations"
             )
@@ -350,7 +357,6 @@ def merge(
 
 @cli.command()
 @click.argument("db_path", type=click.Path(exists=True), required=False)
-@click.option("--session", "-s", help="Filter by session ID")
 @click.option("--output", "-o", type=click.Path(), help="Output file path")
 @click.option(
     "--format",
@@ -360,20 +366,20 @@ def merge(
     help="Output format",
 )
 @click.option(
-    "--audience",
-    "-a",
+    "--mode",
+    "-m",
     type=click.Choice(
-        ["self", "public", "academic", "professional"], case_sensitive=False
+        ["short", "long"], case_sensitive=False
     ),
-    default="self",
-    help="Target audience for the profile",
+    default="short",
+    help="Length of profile",
 )
-def profile(
+@click.pass_context
+def profile(ctx,
     db_path: Optional[str],
-    session: Optional[str],
     output: Optional[str],
     format: str,
-    audience: str,
+    mode: str,
 ):
     """
     Generate a profile from the knowledge base.
@@ -381,14 +387,20 @@ def profile(
     Creates a formatted profile document based on consensus records
     and notes, tailored to the specified audience.
     """
-    db_path = db_path or CONFIG.get("database", {}).get("path")
+
+    config = ctx.obj
+    # Apply overrides if provided
+    if db_path:
+        config.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
+    
     if not db_path:
         console.print(
-            "[red]Error: No database path provided and not found in configuration[/red]"
+            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
         )
         return
 
-    console.print(f"[blue]Generating {audience} profile in {format} format...[/blue]")
+    console.print(f"[blue]Generating {mode} profile in {format} format...[/blue]")
 
     # TODO: Call core function to generate profile
     # from core.profile import generate_profile
@@ -396,7 +408,7 @@ def profile(
 
     # Placeholder implementation
     profile_content = (
-        f"# Sample Profile\n\nThis is a {audience} profile in {format} format."
+        f"# Sample Profile\n\nThis is a {mode} profile in {format} format."
     )
 
     # Output the profile
@@ -410,6 +422,7 @@ def profile(
 
 
 @cli.command()
+@click.argument("db_path", type=click.Path(exists=True), required=False)
 @click.argument("file_patterns", nargs=-1, type=click.Path())
 @click.option(
     "--name", "-n", help="Name template for the content (use {index} for batch)"
@@ -442,9 +455,10 @@ def profile(
 @click.option("--qa", is_flag=True, help="Process content as QA transcript/interview")
 @click.option("--list", is_flag=True, help="List queue contents or matched files")
 @click.option(
-    "--dry-run", is_flag=True, help="Show what would be queued without making changes"
+    "--dryrun", is_flag=True, help="Show what would be queued without making changes"
 )
-def queue(
+def queue(ctx,
+    db_path: Optional[str],
     file_patterns: tuple,
     name: Optional[str],
     author: Optional[str],
@@ -471,7 +485,17 @@ def queue(
     Author can be specified via --author flag or in config.yaml under content.default_author.
     Life stage and type are required when processing content but can be omitted for --list operations.
     """
-    config = get_config()
+    config = ctx.obj
+    # Apply overrides if provided
+    if db_path:
+        config.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
+    
+    if not db_path:
+        console.print(
+            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
+        )
+        return
 
     # List mode is dominant mode. If --list is provided, ignore other options.
 
