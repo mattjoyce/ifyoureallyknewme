@@ -93,6 +93,116 @@ class ConsensusManager:
         finally:
             conn.close()
 
+    def detect_similar_consensus(self, similarity_threshold: float = 0.92) -> List[Dict[str, Any]]:
+        """Find pairs of consensus records that are too similar to each other.
+        
+        Args:
+            similarity_threshold: Similarity threshold above which consensus records are considered duplicates
+            
+        Returns:
+            List of dictionaries with information about similar consensus pairs
+        """
+        DB_PATH = self.config.database.path
+        conn, cursor = get_connection(DB_PATH)
+        
+        try:
+            # Get all consensus records
+            cursor.execute("""
+                SELECT id, content, embedding 
+                FROM knowledge_records 
+                WHERE type = 'consensus' AND embedding IS NOT NULL
+            """)
+            
+            records = []
+            for id, content_json, embedding_blob in cursor.fetchall():
+                if embedding_blob:
+                    embedding = np.frombuffer(embedding_blob, dtype=np.float32)
+                    content = json.loads(content_json)
+                    records.append({
+                        "id": id,
+                        "observation": content["observation"],
+                        "embedding": embedding
+                    })
+            
+            # If fewer than 2 records, no comparisons needed
+            if len(records) < 2:
+                return []
+            
+            # Compute pairwise similarities
+            similar_pairs = []
+            for i in range(len(records)):
+                for j in range(i+1, len(records)):
+                    # Compute cosine similarity between embeddings
+                    similarity = np.dot(records[i]["embedding"], records[j]["embedding"]) / (
+                        np.linalg.norm(records[i]["embedding"]) * np.linalg.norm(records[j]["embedding"])
+                    )
+                    
+                    if similarity > similarity_threshold:
+                        similar_pairs.append({
+                            "consensus1_id": records[i]["id"],
+                            "consensus2_id": records[j]["id"],
+                            "similarity": float(similarity),
+                            "observation1": records[i]["observation"],
+                            "observation2": records[j]["observation"]
+                        })
+            
+            return similar_pairs
+        
+        finally:
+            conn.close()
+
+    def reset_similar_consensus(self, pairs: List[Dict[str, Any]]) -> int:
+        """Reset similar consensus records by unlinking their source records.
+        
+        Args:
+            pairs: List of similar consensus pairs from detect_similar_consensus()
+            
+        Returns:
+            Number of consensus records reset
+        """
+        if not pairs:
+            return 0
+        
+        DB_PATH = self.config.database.path
+        conn, cursor = get_connection(DB_PATH)
+        
+        try:
+            reset_count = 0
+            processed_ids = set()
+            
+            for pair in pairs:
+                consensus1_id = pair["consensus1_id"]
+                consensus2_id = pair["consensus2_id"]
+                
+                # Skip if already processed
+                if consensus1_id in processed_ids or consensus2_id in processed_ids:
+                    continue
+                
+                # Reset consensus_id for all records linked to these consensus records
+                cursor.execute("""
+                    UPDATE knowledge_records
+                    SET consensus_id = NULL
+                    WHERE consensus_id IN (?, ?)
+                """, (consensus1_id, consensus2_id))
+                
+                # Delete the consensus records
+                cursor.execute("""
+                    DELETE FROM knowledge_records
+                    WHERE id IN (?, ?)
+                """, (consensus1_id, consensus2_id))
+                
+                # Mark as processed
+                processed_ids.add(consensus1_id)
+                processed_ids.add(consensus2_id)
+                
+                reset_count += 2
+            
+            conn.commit()
+            return reset_count
+        
+        finally:
+            conn.close()
+
     def find_clusters(
         self, threshold: float = 0.85, record_type: str = "note"
     ) -> Dict[str, Any]:
@@ -283,49 +393,49 @@ class ConsensusManager:
             return []
 
 
-def process_clusters(
-    self,
-    threshold: float = 0.85,
-    kr_type: str = "note",
-    author: str = "ConsensusMaker",
-) -> Dict[str, Any]:
-    """Find clusters and generate consensus in one operation."""
+    def process_clusters(
+        self,
+        threshold: float = 0.85,
+        kr_type: str = "note",
+        author: str = "ConsensusMaker",
+    ) -> Dict[str, Any]:
+        """Find clusters and generate consensus in one operation."""
 
-    # Find clusters
-    clusters = self.find_clusters(threshold, kr_type)
+        # Find clusters
+        clusters = self.find_clusters(threshold, kr_type)
 
-    if not clusters:
-        return {"clusters": {}, "consensus_count": 0, "cluster_count": 0}
+        if not clusters:
+            return {"clusters": {}, "consensus_count": 0, "cluster_count": 0}
 
-    # Process consensus if not in dryrun mode
-    consensus_ids = []  # This will store actual IDs as separate items
+        # Process consensus if not in dryrun mode
+        consensus_ids = []  # This will store actual IDs as separate items
 
-    for cluster_id, cluster in clusters.items():
-        consensus = self.make_consensus(cluster, author)
+        for cluster_id, cluster in clusters.items():
+            consensus = self.make_consensus(cluster, author)
 
-        # Skip if no consensus was generated
-        if not consensus:
-            logger.warning(f"No consensus generated for cluster {cluster_id}")
-            continue
+            # Skip if no consensus was generated
+            if not consensus:
+                logger.warning(f"No consensus generated for cluster {cluster_id}")
+                continue
 
-        timestamp = datetime.utcnow().isoformat()
+            timestamp = datetime.utcnow().isoformat()
 
-        if not self.config.dryrun:
-            record_id = self.save_consensus_record(consensus, author, timestamp)
-        else:
-            record_id = generate_id("DRYRUN", timestamp)
+            if not self.config.dryrun:
+                record_id = self.save_consensus_record(consensus, author, timestamp)
+            else:
+                record_id = generate_id("DRYRUN", timestamp)
 
-        # Append the ID as a single item, not extend it as characters
-        consensus_ids.append(record_id)
+            # Append the ID as a single item, not extend it as characters
+            consensus_ids.append(record_id)
 
-        # Add consensus ID to cluster data for reporting
-        cluster["consensus_ids"] = record_id
+            # Add consensus ID to cluster data for reporting
+            cluster["consensus_ids"] = record_id
 
-    return {
-        "clusters": clusters,
-        "consensus_count": len(consensus_ids),  # Now correctly counts IDs
-        "cluster_count": len(clusters),
-    }
+        return {
+            "clusters": clusters,
+            "consensus_count": len(consensus_ids),  # Now correctly counts IDs
+            "cluster_count": len(clusters),
+        }
 
     def list_clusters(
         self, threshold: float = 0.85, kr_type: str = "note"
