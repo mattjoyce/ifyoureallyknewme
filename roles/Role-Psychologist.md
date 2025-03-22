@@ -34,8 +34,7 @@ Instead of: "The interviewee demonstrates strong analytical skills"
 Write: "Demonstrates strong analytical skills"
 
 Instead of: "The subject grew up in a rural environment" 
-Write: "Grew up in a rural environment"
-** Observation Output Format **
+Write: "Grew up in a rural environment"** Observation Output Format **
 Records must be a JSON array of objects. Each object MUST have these four fields:
 - observation: string   // Clear, atomic observation or insight
 - domain: string        // One classification from schema only.

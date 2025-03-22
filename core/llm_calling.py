@@ -10,92 +10,86 @@ import os
 import json
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+import llm
 
-from .config import get_config, configure_logging
+from .config import ConfigSchema
 
 # Set up logging
 logger = logging.getLogger(__name__)
 
+
 def call_llm_with_prompt(
     input_content: Union[str, Dict, List], 
     prompt: str, 
-    model: str,
+    model_name: str,
     json_output: bool = True
-) -> str:
+) -> Any:  
     """
     Call LLM with a role prompt and input content.
-    
-    Args:
-        input_content: Input text or JSON object to process
-        role_name: Name of the role to use
-        model: Model to use with the LLM
-        json_output: Whether to expect JSON output
-        
-    Returns:
-        String response from the LLM
-    
-    Raises:
-        ValueError: If role file doesn't exist
-        subprocess.CalledProcessError: If LLM call fails
     """
     
     # Convert input to string if it's JSON
     if isinstance(input_content, (dict, list)):
-        import json
         input_str = json.dumps(input_content)
     else:
         input_str = str(input_content)
     
+    logger.debug(f"Calling LLM with model: {model}")
 
-    result = None
-    # Currently using fabric, but this could be replaced with any LLM client
-    #save the composed prompt to a temp file
-    with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-        f.write(prompt)
-        prompt_file = Path(f.name).resolve()
+    model = llm.get_model(model_name or"gpt-4o-mini")
+    context=f"{prompt} \n\n {input_str}"
+    response=model.prompt(prompt=context)
 
+    
+    # Debug the response type
+    logger.debug(f"Response type: {type(response)}")
+    
+    # Get the response content
+    response_dict = response.json()
+    logger.debug(f"Response dict keys: {response_dict.keys()}")
+    
+    # Extract the content
+    response_content = response_dict['content']
+    logger.debug(f"Response content: {response_content[:100]}")
+    logger.debug(f"Response content type: {type(response_content)}")
+
+    # Try parsing here directly for debugging
     try:
-        result = subprocess.run(
-            ["fabric", "--model", model, "-p", str(prompt_file)],
-            input=input_str,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        # Now manually delete the file after using it
-        os.unlink(prompt_file)
+        parsed = json.loads(response_content)
+        logger.debug(f"Successfully parsed content as JSON, type: {type(parsed)}")
+        
+        # If we successfully parsed it and json_output is True, return the parsed object directly
+        if json_output:
+            return parsed
     except Exception as e:
-        print(e)
-        # Still try to delete the file in case of error
-        try:
-            os.unlink(prompt_file)
-        except:
-            pass
-        return
-    # Return the raw output
-    return result.stdout
+        logger.info(f"Error parsing content as JSON: {str(e)}")
+    
+    # If parsing failed or json_output is False, return the raw content
+    if json_output:
+        return parse_llm_response(response_content, expect_json=True)
+    else:
+        return response_content
 
-def parse_llm_response(response: str, expect_json: bool = True) -> Any:
+
+def parse_llm_response(response: Any, expect_json: bool = True) -> Any:
     """
     Parse the LLM response, handling JSON if needed.
-    
-    Args:
-        response: Raw text response from LLM
-        expect_json: Whether to parse as JSON
-        
-    Returns:
-        Parsed JSON object or raw string
-    
-    Raises:
-        json.JSONDecodeError: If JSON parsing fails
     """
+    logger.info(f"parse_llm_response called with type: {type(response)}")
+    
     if not expect_json:
         return response
-
+        
+    # If response is already a dict or list, return it directly
+    if isinstance(response, (dict, list)):
+        print(" Response is already a dict or list, returning directly")
+        return response
+    
     try:
         result = json.loads(response)
         return result
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.info(f"JSON decode error: {str(e)}")
         # Try to extract JSON from text if it's embedded
         import re
         json_pattern = r'(\{[\s\S]*\}|\[[\s\S]*\])'
@@ -106,10 +100,11 @@ def parse_llm_response(response: str, expect_json: bool = True) -> Any:
             except json.JSONDecodeError:
                 pass
         
-        # If all parsing fails, raise the original error
-        raise json.JSONDecodeError(f"Failed to parse JSON from LLM response", response, 0)
+        # If all parsing fails, print the response for debugging
+        logger.info(f"Failed to parse response as JSON: {response}")
+        raise
 
-def llm_process_with_prompt(
+def llm_process_with_prompt(config:ConfigSchema,
     input_content: Union[str, Dict, List],
     prompt: str,
     model: str,
@@ -117,33 +112,30 @@ def llm_process_with_prompt(
 ) -> Any:
     """
     Process input with a role and return parsed results.
-    Convenience function combining call_llm_with_role and parse_llm_response.
-    
-    Args:
-        input_content: Input text or JSON to process
-        role_file: Path to the role prompt file
-        model: Model to use with the LLM
-        expect_json: Whether to parse output as JSON
-        
-    Returns:
-        Processed result (parsed JSON or raw string)
     """
-    config=get_config()
     # Use model from config if not provided
     model = model or config.llm.generative_model
 
-    # Call LLM with role and get raw response
-    response = call_llm_with_prompt(input_content, prompt, model)
+    # Call LLM with role and get response
+    response = call_llm_with_prompt(input_content, prompt, model, json_output=expect_json)
+    
+    # Debug the response
+    logger.info(f"Response from call_llm_with_prompt type: {type(response)}")
+    
+    # If response is already a dict or list, return it directly
+    if isinstance(response, (dict, list)):
+        logger.debug("Response is already a dict or list, returning directly")
+        return response
+        
+    # Otherwise, try to parse it
+    if expect_json:
+        return parse_llm_response(response, expect_json)
+    else:
+        return response
 
-    # Parse the response
-    parsed_response = parse_llm_response(response, expect_json)
 
 
-    return parsed_response
-
-
-
-def get_role_file(role_name: str, role_type: str) -> Path:
+def get_role_file(config: ConfigSchema,role_name: str, role_type: str) -> Path:
     """
     Get the file path for a specific role.
     
@@ -158,8 +150,8 @@ def get_role_file(role_name: str, role_type: str) -> Path:
         FileNotFoundError: If the role file does not exist.
         ValueError: If the role type is invalid.
     """
-    config = get_config()
-    roles_path = Path(config.roles.path)
+
+
     
     # Validate role type
     if role_type not in ["Helper", "Observer"]:
@@ -174,7 +166,7 @@ def get_role_file(role_name: str, role_type: str) -> Path:
     target_role = next((role for role in roles if role.name == role_name), None)
 
     # Construct the role file path
-    role_file = Path(roles_path / target_role.file).resolve()
+    role_file = Path(f"{config.roles.path}/{target_role.file}").resolve()
         
     # Check if the file exists
     if not role_file.exists():
@@ -182,9 +174,8 @@ def get_role_file(role_name: str, role_type: str) -> Path:
     
     return role_file
 
-def get_role_prompt(role_name, role_type):
-    config=get_config()
-    role_file = get_role_file(role_name, role_type)
+def get_role_prompt(config:ConfigSchema, role_name : str, role_type : str):
+    role_file = get_role_file(config, role_name, role_type)
     with open(role_file, "r") as f:
         prompt=f.read()
         if role_type == "Observer":
@@ -198,3 +189,8 @@ def replace_token_with_file_contents(content, token, file_path):
     with open(file_path, "r") as f:
         file_content = f.read()
     return content.replace(token, file_content)
+
+
+def get_embedding(config:ConfigSchema, text: str, model: Optional[str] = None) -> any:
+    embedding_model=llm.get_embedding_model(model or config.llm.embedding_model)
+    vector = embedding_model.embed(text)

@@ -25,9 +25,13 @@ Extract 5-7 key concepts that best represent the semantic core of the text.
 
 Example:
 {
-  keywords = "decision-making patterns, risk preferences, resource allocation, temporal preferences, behavioral economics"
+  "keywords" : "home, uk, family, london"
 }
 
+Example:
+{
+  "keywords" : "influence, leadership, relationships, direct reports, network, hierarchical boundaries"
+}
 
 ## TASK
 Analyze the following text and extract the most important keywords as a comma-separated list.

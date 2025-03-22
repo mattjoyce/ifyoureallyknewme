@@ -8,9 +8,9 @@ import numpy as np
 from typing import List, Tuple, Union, Optional
 from pathlib import Path
 from openai import OpenAI
-from .config import get_config
+from .config import ConfigSchema
 
-def get_embedding(text: str, model: Optional[str] = None) -> np.ndarray:
+def get_embedding(config:ConfigSchema, text: str, model: Optional[str] = None) -> np.ndarray:
     """Get embedding from OpenAI API.
     
     Args:
@@ -20,7 +20,7 @@ def get_embedding(text: str, model: Optional[str] = None) -> np.ndarray:
     Returns:
         Numpy array containing the embedding vector
     """
-    config = get_config()
+
     
     if model is None:
         model = config.llm.embedding_model

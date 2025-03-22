@@ -145,7 +145,7 @@ def process_content(db_path: str, content: str, name:str, author: str, lifestage
                ))
             conn.commit()
             logger.info(f"Successfully added {filename} to the analyse queue")
-            return file_queue_id
+            return file
         except Exception as e:
             conn.rollback()
             logger.error(f"Error processing content: {str(e)}")

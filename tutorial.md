@@ -39,9 +39,30 @@ It attempts to attribute facts and observations to a life stage and knowledge do
 ## Getting Started
 
 The main application is CLI only and is called *knowme.py*
+
+```bash
+❯ python3 knowme.py --help
+Usage: knowme.py [OPTIONS] COMMAND [ARGS]...
+
+  KnowMe - Personal knowledge management and analysis system.
+
+Options:
+  --version      Show the version and exit.
+  --config PATH  Path to config file
+  --help         Show this message and exit.
+
+Commands:
+  analyze  Run expert analysis on content.
+  init     Initialize a new knowledge database.
+  merge    Find clusters of similar notes/facts and create consensus...
+  profile  Generate a profile from the knowledge base.
+  queue    Add content to the analysis queue or process QA transcripts.
+```
+
+
 It uses a yaml config file, here's an example.
 
-``` yaml
+```yaml
 # Database configuration
 database:
   path: private/test.db
@@ -96,6 +117,12 @@ Ok, let's start a new database.
 python3 knowme.py --config test_config.yaml init
 ```
 
+ok, use a text editor, and copy the qa-template.md to your private folder.
+Edit it, and answer the question as fully as you can.
 
+Let's load that QA document into the system.
 
+```bash
+
+```
 

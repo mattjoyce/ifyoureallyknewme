@@ -6,18 +6,14 @@ This is the main entry point for interacting with the TheInterview/KnowMe
 personal knowledge database. It provides commands for creating, consuming,
 analyzing and extracting insights from personal data.
 """
-import glob
-import json
+
 import logging
 import os
-import sqlite3
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
 import click
-import yaml
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
@@ -35,8 +31,8 @@ from core.utils import generate_id, resolve_file_patterns
 # Initialize Rich console
 console = Console()
 
-# Configure logging using the simplified config
-configure_logging(level="WARNING")
+# Set up basic logging - this will be properly configured once config is loaded
+logging.basicConfig(level=logging.INFO, format='%(message)s', handlers=[])
 logger = logging.getLogger(__name__)
 
 
@@ -49,8 +45,15 @@ def cli(ctx, config: Optional[str]):
     """KnowMe - Personal knowledge management and analysis system."""
     # Update global CONFIG if config file path provided
     ctx.obj = CONFIG = get_config(config)
-    print(f"Loaded configuration from {config}")
-    configure_logging(level=CONFIG.logging.level or "WARNING")
+    console.print(f"[blue]Loaded configuration from {config or 'default path'}[/blue]")
+    
+    # Configure logging based on loaded config
+    log_level = CONFIG.logging.level
+    log_file = CONFIG.logging.file
+    
+    logger.debug(f"Updating logging configuration: level={log_level}, file={log_file}")
+    configure_logging(level=log_level, log_file=log_file)
+    logger.info(f"Logging configured with level={log_level}, file={log_file}")
 
 
 @cli.command()
@@ -146,8 +149,8 @@ def analyze(
                     console.print(
                         f"[blue]Analyzing session {session['id']} ({session['title']})...[/blue]"
                     )
-                    results = run_multiple_role_analyses(
-                        db_path, session["id"], session["missing_observers"], model
+                    results = run_multiple_role_analyses(config,
+                        db_path, session["id"], session["missing_observers"], config.roles.schema_file, model
                     )
 
                     # Display results
@@ -213,13 +216,15 @@ def analyze(
     default="notes",
     help="Type of records to merge",
 )
-@click.option("--session", "-s", help="Filter by session ID")
+@click.option("--list", "-l", is_flag=True, help="List clusters without merging")
+@click.option("--model", "-m", help="LLM model to use (default: from config)")
 def merge(
     db_path: Optional[str],
     threshold: float,
     whatif: bool,
     type: str,
-    session: Optional[str],
+    list: bool,
+    model: Optional[str],
 ):
     """
     Find clusters of similar notes/facts and create consensus records.
@@ -235,16 +240,83 @@ def merge(
         )
         return
 
+    # Convert type to singular form for database query
+    record_type = "note" if type.lower() == "notes" else "fact"
+
+    # Import the consensus module
+    from core.consensus import ConsensusManager
+
+    # Initialize the consensus manager
+    consensus_manager = ConsensusManager(config, db_path)
+
+    if list:
+        # Just list clusters without creating consensus
+        console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
+        
+        result = consensus_manager.list_clusters(threshold, record_type)
+        
+        if not result["clusters"]:
+            console.print("[yellow]No clusters found with the current threshold.[/yellow]")
+            return
+            
+        console.print(f"[green]Found {result['cluster_count']} clusters containing {result['record_count']} observations[/green]")
+        
+        # Create a table to display clusters
+        table = Table(title=f"Observation Clusters (threshold={threshold})")
+        table.add_column("Cluster", style="cyan")
+        table.add_column("Life Stage", style="blue")
+        table.add_column("Count", style="green", justify="right")
+        table.add_column("Avg. Similarity", style="yellow", justify="right")
+        table.add_column("Domains", style="magenta")
+        table.add_column("Sample Observation", style="white")
+        
+        for cluster_id, cluster in result["clusters"].items():
+            # Truncate sample observation if too long
+            sample = cluster["observations"][0]
+            if len(sample) > 60:
+                sample = sample[:57] + "..."
+                
+            # Format domains as comma-separated list
+            domains = ", ".join(cluster["domains"]) if cluster["domains"] else "-"
+            
+            table.add_row(
+                cluster_id,
+                cluster["life_stage"],
+                str(cluster["observation_count"]),
+                f"{cluster['average_similarity']:.2f}",
+                domains,
+                sample
+            )
+            
+        console.print(table)
+        return
+        
+    # Process clusters and create consensus
     console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
-
-    # TODO: Call core functions to find clusters and create consensus
-    # from core.clusters import find_clusters
-    # from core.consensus import create_consensus
-
-    # Placeholder implementation
-    mode = "What-if" if whatif else "Actual"
-    console.print(f"[green]{mode} merge complete with threshold {threshold}[/green]")
-    console.print("Created 5 consensus records from 14 individual notes")
+    
+    try:
+        result = consensus_manager.process_clusters(
+            threshold=threshold,
+            record_type=record_type,
+            model=model,
+            whatif=whatif
+        )
+        
+        if not result["clusters"]:
+            console.print("[yellow]No clusters found with the current threshold.[/yellow]")
+            return
+            
+        mode = "What-if" if whatif else "Actual"
+        console.print(f"[green]{mode} merge complete with threshold {threshold}[/green]")
+        
+        if whatif:
+            console.print(f"Would create approximately {len(result['clusters'])} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations")
+        else:
+            console.print(f"Created {result['consensus_count']} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations")
+            
+    except Exception as e:
+        console.print(f"[red]Error during consensus processing: {str(e)}[/red]")
+        logging.exception("Error during consensus processing")
 
 
 @cli.command()

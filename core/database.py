@@ -4,18 +4,18 @@ Only includes the most essential shared database functionality.
 Module-specific database operations should remain in their respective modules.
 """
 import logging
+import os
 import sqlite3
 from pathlib import Path
 from typing import Optional
 
-from .config import get_config, configure_logging
+from .config import ConfigSchema
 
-# Configure logging
-configure_logging()
+# Get logger
 logger = logging.getLogger(__name__)
 
 
-def create_database(db_path: Optional[str] = None) -> bool:
+def create_database(config:ConfigSchema, db_path: Optional[str] = None) -> bool:
     """
     Create a new database with the schema from schema.sql.
     
@@ -27,7 +27,6 @@ def create_database(db_path: Optional[str] = None) -> bool:
         bool: True if database creation was successful, False otherwise
     """
     try:
-        config = get_config()
         schema_path = Path(config.database.schema_path)
         if not schema_path.exists():
             raise FileNotFoundError(f"Schema file not found at {schema_path}")
@@ -69,12 +68,17 @@ def get_connection(db_path: Optional[str] = None) -> sqlite3.Connection:
         ValueError: If no database path provided or found in config
         sqlite3.Error: If connection fails
     """
-    config = get_config()
-    db_path = db_path or config.databse.path
+
     if not db_path:
         raise ValueError("No database path provided and not found in configuration")
+    
+    if not os.path.exists(db_path):
+        raise FileNotFoundError(f"Database file not found: {db_path}")
         
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    cursor=conn.cursor()
-    return conn, cursor
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cursor=conn.cursor()
+        return conn, cursor
+    except sqlite3.Error as e:    
+        raise sqlite3.Error(f"Error connecting to database: {str(e)}")

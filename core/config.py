@@ -105,11 +105,44 @@ def configure_logging(level: Optional[str] = None, log_file: Optional[str] = Non
     Args:
         level: Optional override for log level.
         log_file: Optional override for log file path.
+               - If set to '-', only logs to console
+               - If None, uses default "knowme.log"
     """
+    from rich.logging import RichHandler
+    
     level = level or "WARNING"
-    log_file = log_file or "knowme.log"        
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        filename=log_file if log_file != '-' else None
-    )
+    log_file = log_file or "knowme.log"
+    
+    # Reset root logger
+    root = logging.getLogger()
+    if root.handlers:
+        for handler in root.handlers:
+            root.removeHandler(handler)
+    
+    # Set the root logger level
+    root.setLevel(getattr(logging, level.upper()))
+    
+    # Create formatters
+    file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    
+    # Always add a Rich console handler
+    console_handler = RichHandler(rich_tracebacks=True, markup=True)
+    root.addHandler(console_handler)
+    
+    # Add file handler if needed
+    if log_file != '-':
+        try:
+            # Create directory if it doesn't exist
+            log_dir = os.path.dirname(log_file)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir)
+                
+            # Add file handler
+            file_handler = logging.FileHandler(log_file)
+            file_handler.setFormatter(file_formatter)
+            root.addHandler(file_handler)
+        except Exception as e:
+            print(f"Error setting up file logging: {e}")
+    
+    # Log a test message to confirm configuration
+    logging.debug(f"Logging configured at level {level} with {'console and file' if log_file != '-' else 'console only'}")
