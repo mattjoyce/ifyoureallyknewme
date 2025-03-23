@@ -122,6 +122,8 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
     if dryrun:
         config.dryrun = True
     
+    observer_names = [observer.name for observer in config.roles.Observers]
+
     analysis_manager = AnalysisManager(config)
     
     if queue or queue_id:
@@ -130,66 +132,70 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
         if queue_id:
             # Process specific queue item
             console.print(f"[blue]Processing queue item {queue_id}[/blue]")
-            
-            if dryrun:
-                console.print("[yellow]Dry run mode - not actually processing[/yellow]")
-                return
-            
-            # Get queue item
-            conn, cursor = get_connection(config.database.path)
-            cursor.execute(
-                """
-                SELECT id, name, metadata
-                FROM analysis_queue
-                WHERE id = ?
-                """,
-                (queue_id,)
-            )
-            item = cursor.fetchone()
-            conn.close()
-            
+
+
+            item=loader.get_source_and_queue_item(queue_id=queue_id)
+       
             if not item:
-                console.print(f"[red]Queue item {queue_id} not found[/red]")
+                console.print(f"[red]Source Queue item {queue_id} not found[/red]")
                 return
             
-            metadata = json.loads(item[2]) if item[2] else {}
-            source_id = metadata.get('source_id')
-            
-            if not source_id:
+            logging.info(f"source_id: {item['source_id']}")
+
+
+            if not item['source_id']:
                 console.print(f"[red]Queue item {queue_id} has no source_id in metadata[/red]")
                 return
             
             # Process the item
-            session_id = analysis_manager.run_analysis_on_source(source_id, queue_id, 
-                [observer.name for observer in config.roles.Observers])
-            
+            session_id = analysis_manager.create_session(item)
+            logger.info(f"Process the item - session_id: {session_id}")
+                                                                       
             if session_id:
                 console.print(f"[green]Successfully analyzed queue item {queue_id}[/green]")
                 console.print(f"[green]Created session {session_id}[/green]")
             else:
                 console.print(f"[red]Failed to analyze queue item {queue_id}[/red]")
+
+            result=analysis_manager.run_multiple_role_analyses(session_id,observer_names)
+            console.print(f"[blue]Results: {result} [/blue]")
+            return
             
         else:
             # Process next queue item
             console.print("[blue]Processing next item in the queue...[/blue]")
+            # Get next item
+            items = loader.get_queue_items(status="pending", limit=1)     
             
-            if dryrun:
-                # Get next item for display
-                items = loader.get_queue_items(status="pending", limit=1)
-                if not items:
-                    console.print("[yellow]Queue is empty[/yellow]")
-                    return
-                
-                item = items[0]
-                console.print(f"[yellow]Would process: {item['name']} (ID: {item['id']})[/yellow]")
+            if not items:
+                console.print("[yellow]Queue is empty[/yellow]")
                 return
-            
-            session_id = analysis_manager.process_next_queue_item()
-            
-            if session_id:
-                console.print(f"[green]Successfully processed queue item, created session {session_id}[/green]")
-            else:
-                console.print("[yellow]No items in the queue or processing failed[/yellow]")
+
+            #each queue item is a dictionary
+            for item in items:
+
+                if dryrun:
+                    console.print(f"[yellow]Would process: {item['title']} (ID: {item['id']})[/yellow]")
+                    return
+                    
+                # create a session for the item
+                session_id = analysis_manager.create_session(item)
+
+                if session_id:
+                    console.print(f"[green]Successfully created session {session_id}[/green]")
+                else:
+                    console.print("[yellow]No items in the queue or processing failed[/yellow]")
+                
+                # get sessions that are not yet analyzed
+                sessions=analysis_manager.get_unanalyzed_sessions(observer_names)
+                console.print(f"[blue]Sessions: {sessions} for analysis [/blue]")
+
+                # run analysis on the sessions
+                for session in sessions:
+                    results=analysis_manager.run_multiple_role_analyses(session['id'], observer_names)
+                    console.print(f"[blue]Results: {results} [/blue]")
+
+
 
 
 @cli.command()

@@ -2,17 +2,6 @@ CREATE TABLE sources (
     id TEXT PRIMARY KEY,
     created_at TEXT
 , description TEXT, content_path TEXT, title TEXT);
-CREATE TABLE analysis_queue (
-    id TEXT PRIMARY KEY,
-    author TEXT NOT NULL,
-    lifestage TEXT NOT NULL,
-    type TEXT NOT NULL DEFAULT 'document',  -- document, qa, etc.
-    priority INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'completed', 'failed')),
-    created_at TEXT NOT NULL, source_id TEXT);
-CREATE INDEX idx_analysis_queue_status ON analysis_queue(status);
-CREATE INDEX idx_analysis_queue_priority ON analysis_queue(priority);
-CREATE INDEX idx_analysis_queue_type ON analysis_queue(type);
 CREATE TABLE processing_log (
     id TEXT PRIMARY KEY,
     queue_id TEXT NOT NULL,
@@ -31,10 +20,9 @@ CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
     title TEXT,
     description TEXT NULL,
-    transcript_file TEXT NULL,
     created_at TEXT,
     metadata JSON NULL
-, source_id TEXT, content_type TEXT);
+, source_id TEXT, content_type TEXT, author text, lifestage text, file_path text);
 CREATE TABLE qa_pairs (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -83,4 +71,14 @@ CREATE TABLE knowledge_records (
     FOREIGN KEY (qa_id) REFERENCES qa_pairs(id),
     FOREIGN KEY (session_id) REFERENCES sessions(id),
     FOREIGN KEY (source_id) REFERENCES sources(id)
+);
+CREATE TABLE analysis_queue (
+    id TEXT PRIMARY KEY,
+    author TEXT NOT NULL,
+    lifestage TEXT NOT NULL,
+    type TEXT NOT NULL DEFAULT 'document',
+    priority INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'processing', 'completed', 'failed', 'cancelled')),
+    created_at TEXT NOT NULL,
+    source_id TEXT
 );

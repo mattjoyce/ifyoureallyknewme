@@ -306,6 +306,7 @@ class Loader:
     ) -> List[Dict[str, Any]]:
         """
         Get items from the analysis queue.
+        Or a specific queue item by ID.
 
         Args:
             status: Filter by status (e.g., 'pending', 'processing', 'completed')
@@ -316,6 +317,8 @@ class Loader:
             List of queue items as dictionaries
         """
         conn, cursor = get_connection(self.db_path)
+
+        
 
         try:
             query = """
@@ -345,6 +348,52 @@ class Loader:
 
         finally:
             conn.close()
+
+    def get_source_and_queue_item(self, source_id=None, queue_id=None) -> Dict[str, Any]:
+        """
+        Retrieves a queue item and its associated source based on either source_id or queue_id.
+        Exactly one of the parameters must be provided.
+        
+        Args:
+            source_id: Optional source ID to search by
+            queue_id: Optional queue ID to search by
+            
+        Returns:
+            A row containing queue item and source information or None if not found
+        """
+        if not (source_id or queue_id) or (source_id and queue_id):
+            raise ValueError("Exactly one of source_id or queue_id must be provided")
+        
+        conn, cursor = get_connection(self.db_path)
+        
+        if source_id:
+            query = """SELECT aq.id, aq.author, aq.lifestage, aq.type,
+                      aq.created_at, aq.status, aq.priority,
+                      s.id as source_id, s.description, s.content_path, s.title
+                      FROM analysis_queue aq
+                      JOIN sources s ON aq.source_id = s.id
+                      WHERE aq.source_id = ?"""
+            params = [source_id]
+        else:  # queue_id is provided
+            query = """SELECT aq.id, aq.author, aq.lifestage, aq.type,
+                      aq.created_at, aq.status, aq.priority,
+                      s.id as source_id, s.description, s.content_path, s.title
+                      FROM analysis_queue aq
+                      JOIN sources s ON aq.source_id = s.id
+                      WHERE aq.id = ?"""
+            params = [queue_id]
+        
+        cursor.execute(query, params)
+        item = cursor.fetchone()
+        result = dict(item) if item else None
+        conn.close()
+        
+        return result
+    
+
+
+
+
 
     def create_context_from_source(
         self, source_id: str, author: str, lifestage: str

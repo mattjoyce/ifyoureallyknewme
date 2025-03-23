@@ -16,8 +16,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 
 import numpy as np
 from .config import ConfigSchema
-from .utils import generate_id, extract_json
-from .ingest import get_session_data, create_session_context
+from .utils import generate_id, timestamp
 from .embedding import get_embedding
 from .llm_calling import llm_process_with_prompt, get_role_prompt, extract_keywords
 from .database import get_connection
@@ -29,56 +28,6 @@ logger = logging.getLogger(__name__)
 class AnalysisManager:
     def __init__(self, config:ConfigSchema):
         self.config = config
-
-    # moved to llm_calling.py
-    #
-    #
-    # def extract_keywords(self, content: str) -> List[str]:
-    #     """
-    #     Extract keywords from text using the KeywordExtractor role.
-    #     """
-
-    #     MODEL_NAME=self.config.llm.generative_model
-
-    #     # Type safety check
-    #     if not isinstance(content, str) or not content:
-    #         logger.warning(
-    #             f"extract_keywords received non-string or empty content: {type(content)}"
-    #         )
-    #         return []
-
-    #     # Get role path
-    #     role_prompt = get_role_prompt(self.config,"KeywordExtractor", "Helper")
-
-    #     try:
-    #         # Use centralized LLM calling
-    #         result = llm_process_with_prompt(self.config,
-    #             input_content=content, prompt=role_prompt, model=MODEL_NAME, expect_json=True
-    #         )
-
-    #         # Make sure result is a dictionary before trying to extract keywords
-    #         if isinstance(result, dict) and "keywords" in result:
-    #             keywords_str = result["keywords"]
-    #         else:
-    #             # Try to extract keywords from the result
-    #             try:
-    #                 parsed_result = extract_json(result)
-    #                 keywords_str = parsed_result.get("keywords", "")
-    #             except Exception as e:
-    #                 logger.error(f"Failed to extract keywords JSON: {str(e)}")
-    #                 return []
-
-    #         # Process the comma-separated output
-    #         if isinstance(keywords_str, str):
-    #             keywords = [kw.strip() for kw in keywords_str.split(",")]
-    #             return [kw for kw in keywords if kw]  # Filter out empty strings
-    #         else:
-    #             logger.warning(f"Expected string for keywords, got {type(keywords_str)}")
-    #             return []
-
-    #     except Exception as e:
-    #         logger.error(f"Error in keyword extraction: {str(e)}")
-    #         return []
 
 
     def store_knowledge_record(self,
@@ -99,15 +48,6 @@ class AnalysisManager:
         """
 
         MODEL_NAME=self.config.llm.generative_model
-
-        # # Extract keywords from the observation text
-        # observation_text = content.get("observation", content.get("content", ""))
-
-        # # Now extract keywords from the string
-        # keywords = self.extract_keywords(observation_text)
-        # logger.info(f"keywords : {keywords}")
-
-
 
         # Store as knowledge record
         cursor.execute(
@@ -152,22 +92,10 @@ class AnalysisManager:
         existing_count = cursor.fetchone()[0]
         conn.close()
 
-        if existing_count > 0:
-            logger.info(
-                f"Analysis for {role_name} on session {session_id} already exists with {existing_count} records"
-            )
-            return None
-
         try:
-            # Get session data
-            logger.debug(f"Retrieving session data for {session_id}")
-            session, qa_pairs = get_session_data(DB_PATH, session_id)
-            logger.debug(
-                f"Session data retrieved: {session['title']}, {len(qa_pairs)} QA pairs"
-            )
-
             # Create input data
-            input_content = create_session_context(session, qa_pairs)
+            print(f"create_session_context: {session_id}")
+            input_content = self.create_session_context(session_id)
             logger.debug(f"Created session context, length: {len(input_content)}")
 
             # Get role prompt
@@ -203,7 +131,6 @@ class AnalysisManager:
             # Store notes in the database
             conn, cursor = get_connection(DB_PATH)
 
-            timestamp = datetime.utcnow().isoformat()
             note_ids = []
 
             logger.info(f"Storing {len(observations)} observations for {role_name}")
@@ -211,8 +138,7 @@ class AnalysisManager:
             # Process each observation individually
             for idx, obs in enumerate(observations):
                 logger.debug(f"Processing observation {idx+1}/{len(observations)}")
-
-                observation_text = obs.get("observation")
+                observation_text = obs["observation"]
                 if not observation_text:
                     logger.warning(f"Observation {idx+1} missing 'observation' field")
                     continue
@@ -229,7 +155,7 @@ class AnalysisManager:
                 # observation_text = obs.get("observation", content.get("content", ""))
 
                 # Now extract keywords from the string
-                keywords = extract_keywords(observation_text)
+                keywords = extract_keywords(self.config, observation_text)
                 logger.info(f"keywords : {keywords}")                
 
                 if not self.config.dryrun:
@@ -241,7 +167,7 @@ class AnalysisManager:
                             record_type="note",
                             author=role_name,
                             content=obs,
-                            timestamp=timestamp,
+                            timestamp=timestamp(),
                             embedding_bytes=embedding_bytes,
                             session_id=session_id,
                             keywords=keywords,
@@ -401,7 +327,7 @@ class AnalysisManager:
             )
 
             sessions = [dict(row) for row in cursor.fetchall()]
-            logger.debug(f"Found {len(sessions)} sessions in database")
+            logger.info(f"Found {len(sessions)} sessions in database")
 
             # For each session, check which experts have analyzed it
             incomplete_sessions = 0
@@ -410,7 +336,7 @@ class AnalysisManager:
                 session_id = session["id"]
                 session["missing_observers"] = []
 
-                logger.debug(f"Checking session {session_id}: {session['title']}")
+                logger.info(f"Checking session {session_id}: {session['title']}")
 
                 # First check distinct authors that have analyzed this session
                 cursor.execute(
@@ -423,7 +349,7 @@ class AnalysisManager:
                 )
 
                 existing_authors = [row[0] for row in cursor.fetchall()]
-                logger.debug(
+                logger.info(
                     f"Session {session_id} has been analyzed by: {', '.join(existing_authors or ['none'])}"
                 )
 
@@ -431,7 +357,7 @@ class AnalysisManager:
                     # Check if this expert has analyzed this session
                     cursor.execute(
                         """
-                        SELECT COUNT(*) FROM knowledge_records
+                        SELECT count(session_id) FROM knowledge_records
                         WHERE session_id = ? AND author = ?
                     """,
                         (session_id, role_name),
@@ -439,6 +365,7 @@ class AnalysisManager:
 
                     count = cursor.fetchone()[0]
                     if count == 0:
+                        # Add to missing observers list
                         session["missing_observers"].append(role_name)
                         logger.debug(
                             f"Session {session_id} is missing observer: {role_name}"
@@ -469,25 +396,117 @@ class AnalysisManager:
             logger.error(f"Error finding unanalyzed sessions: {str(e)}")
             return []
 
-    def create_session_context(session: Dict, source_content: str, description: Optional[str] = None) -> str:
+    def create_session_context(self, session_id: str) -> str:
         """
         Create a context document with session information and content.
+        Fetches the session data and reads content from the file path.
         
         Args:
-            session: Session data
-            source_content: The content text
-            description: Optional description to include
+            session_id: ID of the session to retrieve
             
         Returns:
             Formatted context document text
         """
-        context = f"# Session: {session['title']}\n\n"
+        # Get database connection
+        conn, cursor = get_connection(self.config.database.path)
+        
+        try:
+            # Get session details
+            cursor.execute(
+                """
+                SELECT id, title, description, created_at, source_id, 
+                    content_type, author, lifestage, file_path
+                FROM sessions
+                WHERE id = ?
+                """, 
+                (session_id,)
+            )
+            
+            session = cursor.fetchone()
+            if not session:
+                raise ValueError(f"Session {session_id} not found")
+            
+            #convert to dictionary
+            session = dict(session)
 
-        if description or session.get("description"):
-            context += f"{description or session.get('description', '')}\n\n"
 
-        # Add the content
-        context += source_content
+            # Create the context header
+            context = f"Title: {session['title']}\n"
+            
+            # Add description if available
+            if session['description']:
+                context += f"Description: {session['description']}\n"
+            
+            # Add metadata about author and lifestage
+            context += f"Author: {session['author']}\n"
+            context += f"Life Stage: {session['lifestage']}\n"
+            context += f"---\n"
+            
+            # Read and add content from file path
+            file_path = session['file_path']
+            if file_path and Path(file_path).exists():
+                try:
+                    source_content = Path(file_path).read_text(encoding="utf-8")
+                    context += source_content
+                except Exception as e:
+                    raise IOError(f"Error reading content file: {str(e)}")
+            else:
+                raise FileNotFoundError(f"Content file not found: {file_path}")
+            
+            return context
+            
+        finally:
+            conn.close()
 
-        return context
+    def create_session(self,item : Dict[str, Any]) -> Optional[str]:
+        """
+        Process the next pending item in the queue.
+        1. create a session record
+        
+        Returns:
+            Session ID if an item was processed, None if queue is empty
+        """
+        logger.info(f"Processing queue item: {item}")
 
+        # if session already exists, for this source, return
+        conn, cursor = get_connection(self.config.database.path)
+        cursor.execute(
+            """
+            SELECT id FROM sessions
+            WHERE source_id = ? 
+            """,
+            (item['source_id'],)
+        )
+        existing_sessions = cursor.fetchall()
+        if existing_sessions:
+            logger.info(f"Session already exists for source: {item['source_id']}")
+            return None
+        
+        logger.info(f"No session exists for source: {item['source_id']}")
+
+
+        ## Create a session record
+        conn, cursor = get_connection(self.config.database.path)
+        session_id=generate_id("session", item['source_id'], item['id'])
+        cursor.execute(
+            """
+            INSERT INTO sessions (id, title, description, author, lifestage, file_path, content_type, source_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                session_id,
+                item['title'],
+                item['description'],
+                item['author'],
+                item['lifestage'],
+                item['content_path'],
+                "document",
+                item['source_id'],
+                timestamp(),
+            )
+        )
+        conn.commit()
+        conn.close()
+
+        return session_id
+        

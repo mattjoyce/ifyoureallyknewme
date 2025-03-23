@@ -1,10 +1,18 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 import re
 import os
 import glob
 from typing import Dict, List, Union
+
+def timestamp() -> str:
+    # Get the current time in UTC
+    current_time_utc = datetime.now(timezone.utc)
+
+    # Format as ISO 8601
+    iso_timestamp = current_time_utc.isoformat()
+    return iso_timestamp
 
 def resolve_file_patterns(file_patterns, recursive=True):
     """
