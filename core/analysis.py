@@ -469,239 +469,25 @@ class AnalysisManager:
             logger.error(f"Error finding unanalyzed sessions: {str(e)}")
             return []
 
+    def create_session_context(session: Dict, source_content: str, description: Optional[str] = None) -> str:
+        """
+        Create a context document with session information and content.
+        
+        Args:
+            session: Session data
+            source_content: The content text
+            description: Optional description to include
+            
+        Returns:
+            Formatted context document text
+        """
+        context = f"# Session: {session['title']}\n\n"
 
+        if description or session.get("description"):
+            context += f"{description or session.get('description', '')}\n\n"
 
+        # Add the content
+        context += source_content
 
+        return context
 
-def process_document(
-    db_path: str,
-    content: str,
-    metadata: Dict[str, str],
-    expert_roles: List[str],
-    model: Optional[str] = None,
-) -> Dict[str, int]:
-    """Process a document with multiple expert roles."""
-    model = model or MODEL_NAME
-    results = {}
-
-    try:
-        # Create session for document
-        session_id = generate_id("session", metadata["name"])
-        timestamp = datetime.utcnow().isoformat()
-
-        # Store document as source
-        source_id = generate_id("source", metadata["name"])
-
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        # Store source
-        cursor.execute(
-            "INSERT INTO sources (id, name, type, created_at) VALUES (?, ?, ?, ?)",
-            (source_id, metadata["name"], metadata.get("type", "document"), timestamp),
-        )
-
-        # Store session
-        cursor.execute(
-            "INSERT INTO sessions (id, title, description, created_at, metadata) VALUES (?, ?, ?, ?, ?)",
-            (
-                session_id,
-                metadata.get("title", metadata["name"]),
-                metadata.get("description", ""),
-                timestamp,
-                json.dumps(metadata),
-            ),
-        )
-
-        # Process with each expert role
-        for expert in expert_roles:
-            try:
-                role_path = config.get_role_file_path(expert)
-                if not role_path or not role_path.exists():
-                    logger.error(f"Role file for {expert} not found")
-                    continue
-
-                logger.info(f"Running {expert} analysis on document {metadata['name']}")
-
-                # Use centralized LLM calling
-                response = llm_process_with_prompt(
-                    input_content=content,
-                    role_file=str(role_path),
-                    model=model,
-                    expect_json=True,
-                )
-
-                # Handle response format
-                observations = response if isinstance(response, list) else [response]
-
-                # Store observations as knowledge records
-                note_count = 0
-                for obs in observations:
-                    observation_text = obs.get("observation", obs.get("content", ""))
-                    if not observation_text:
-                        continue
-
-                    embedding = get_embedding(observation_text)
-                    embedding_bytes = embedding.tobytes()
-
-                    # Generate unique note ID
-                    note_id = generate_id("note", session_id, expert, str(note_count))
-
-                    # Store the knowledge record
-                    self.store_knowledge_record(
-                        cursor=cursor,
-                        note_id=note_id,
-                        record_type="note",
-                        domain=expert.lower(),
-                        author=expert,
-                        content=obs,
-                        timestamp=timestamp,
-                        embedding_bytes=embedding_bytes,
-                        session_id=session_id,
-                        source_id=source_id,
-                        model=model,
-                    )
-                    note_count += 1
-
-                conn.commit()
-                results[expert] = note_count
-
-            except Exception as e:
-                logger.error(f"Error processing with {expert}: {str(e)}")
-                results[expert] = 0
-                continue
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Error in document processing: {str(e)}")
-        return {}
-    finally:
-        if "conn" in locals():
-            conn.close()
-
-
-def process_queued_document(
-    db_path: str,
-    queue_id: str,
-    expert_roles: Optional[List[str]] = None,
-    model: Optional[str] = None,
-) -> Dict[str, int]:
-    """
-    Process a document from the analysis queue.
-
-    Args:
-        db_path: Path to the SQLite database
-        queue_id: ID of the queue item to process
-        expert_roles: List of expert roles to run (optional)
-        model: Name of the LLM model to use (optional)
-
-    Returns:
-        Dictionary mapping expert names to counts of notes created
-    """
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-
-        # Get queue item
-        cursor.execute(
-            "SELECT name, author, lifestage, filename FROM analysis_queue WHERE id = ?",
-            (queue_id,),
-        )
-        row = cursor.fetchone()
-        if not row:
-            raise ValueError(f"Queue item {queue_id} not found")
-
-        name, author, lifestage, filename = row
-
-        # Read the document
-        with open(filename, "r") as f:
-            content = f.read()
-
-        # Process the document
-        results = process_document(
-            db_path,
-            content,
-            {
-                "name": name,
-                "author": author,
-                "lifestage": lifestage,
-                "filename": filename,
-            },
-            expert_roles
-            or [
-                "Psychologist",
-                "Demographer",
-                "BehavioralEconomist",
-                "PoliticalScientist",
-            ],
-            model,
-        )
-
-        # Mark as completed
-        if results:
-            cursor.execute(
-                "UPDATE analysis_queue SET completed = 1 WHERE id = ?", (queue_id,)
-            )
-            conn.commit()
-
-        conn.close()
-        return results
-
-    except Exception as e:
-        logger.error(f"Error processing queue item {queue_id}: {str(e)}")
-        return {}
-
-
-
-def get_unanalyzed_documents(config:ConfigSchema,
-    db_path: str, expert_roles: List[str]
-) -> List[Dict[str, Any]]:
-    """
-    Find documents that haven't been analyzed by specified experts.
-
-    Args:
-        db_path: Path to the SQLite database
-        expert_roles: List of expert roles to check
-
-    Returns:
-        List of document dictionaries with id, name, and missing_experts fields
-    """
-
-    db_path = db_path or config.database.path
-
-    try:
-        conn, cursor = get_connection(db_path)
-
-        # Get all documents
-        cursor.execute("SELECT id, name FROM sources")
-        documents = [dict(row) for row in cursor.fetchall()]
-
-        # For each document, check which experts have analyzed it
-        for doc in documents:
-            doc_id = doc["id"]
-            doc["missing_experts"] = []
-
-            for role_name in expert_roles:
-                # Check if this expert has analyzed this document
-                cursor.execute(
-                    """
-                    SELECT COUNT(*) FROM knowledge_records
-                    WHERE source_id = ? AND author = ?
-                """,
-                    (doc_id, role_name),
-                )
-
-                count = cursor.fetchone()[0]
-                if count == 0:
-                    doc["missing_experts"].append(role_name)
-
-            # Add a complete flag, if a document has no missing experts
-            doc["is_complete"] = len(doc["missing_experts"]) == 0
-
-        conn.close()
-        return documents
-
-    except sqlite3.Error as e:
-        logger.error(f"Error finding unanalyzed documents: {str(e)}")
-        return []

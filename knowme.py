@@ -8,6 +8,7 @@ analyzing and extracting insights from personal data.
 """
 
 import logging
+import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -22,10 +23,12 @@ from rich.table import Table
 
 from core.analysis import AnalysisManager
 from core.consensus import ConsensusManager
+from core.load import Loader
 from core.config import configure_logging, get_config
 from core.database import create_database, get_connection
 from core.ingest import process_content
 from core.utils import generate_id, resolve_file_patterns
+
 
 # Initialize Rich console
 console = Console()
@@ -95,130 +98,98 @@ def init(ctx, db_path: Optional[str]):
 
 @cli.command()
 @click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option(
-    "--list", "-l", is_flag=True, help="List sessions/notes that need analysis"
-)
 @click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
-@click.option("--sessions", is_flag=True, help="Analyze sessions only")
+@click.option("--queue-id", help="Process a specific queue item by ID")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
 @click.option("--dryrun", is_flag=True, help="Dry run mode")
 @click.pass_context
-def analyze(ctx,
-    db_path: Optional[str],
-    list: bool,
-    queue: bool,
-    sessions: bool,
-    model: Optional[str],
-    dryrun: bool,
-):
+def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str], 
+            model: Optional[str], dryrun: bool):
     """
-    Run expert analysis on content.
-
-    If --list is provided, shows items that need analysis.
-    If --session is provided, processes all sessions.
-    If --queue is provided, processes items in the analysis queue.
+    Run expert analysis on content in the queue.
+    
+    If --queue is provided, processes the next pending item in the queue.
+    If --queue-id is provided, processes that specific queue item.
     """
     config = ctx.obj
     # Apply overrides if provided
     if db_path:
         config.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-    
     
     if model:
         config.llm.generative_model = model
-        console.print(f"[blue]Overriding LLM model: {model}[/blue]")
-
+    
     if dryrun:
         config.dryrun = True
-
+    
     analysis_manager = AnalysisManager(config)
-
-    # Load expert roles from config
-    observer_names = [observer.name for observer in config.roles.Observers]
-
-    if not observer_names:
-        console.print("[red]Error: No observer roles found in configuration[/red]")
-        return
-
-    if sessions:
-        sessions_for_analysis = analysis_manager.get_unanalyzed_sessions(observer_names)
-
-        if list:
-            console.print("[blue]Listing items that need analysis...[/blue]")
-
-            table = Table(title="Sessions Missing Expert Analysis")
-            table.add_column("Session ID", style="cyan")
-            table.add_column("Expert Name", style="green")
-
-            for session in sessions_for_analysis:
-                if not session["is_complete"]:
-                    for expert in session["missing_observers"]:
-                        table.add_row(session["id"], expert)
-
-            console.print(table)
-            return
-
-        # Now process sessions
-        console.print("[blue]Analyzing all incomplete sessions[/blue]")
-        with Progress() as progress:
-            task = progress.add_task(
-                "[green]Analyzing sessions...", total=len(sessions_for_analysis)
+    
+    if queue or queue_id:
+        loader = Loader(config)
+        
+        if queue_id:
+            # Process specific queue item
+            console.print(f"[blue]Processing queue item {queue_id}[/blue]")
+            
+            if dryrun:
+                console.print("[yellow]Dry run mode - not actually processing[/yellow]")
+                return
+            
+            # Get queue item
+            conn, cursor = get_connection(config.database.path)
+            cursor.execute(
+                """
+                SELECT id, name, metadata
+                FROM analysis_queue
+                WHERE id = ?
+                """,
+                (queue_id,)
             )
-            for session in sessions_for_analysis:
-                if session["missing_observers"]:  # Only analyze sessions that need it
-                    console.print(
-                        f"[blue]Analyzing session {session['id']} ({session['title']})...[/blue]"
-                    )
-                    results = analysis_manager.run_multiple_role_analyses(
-                        session["id"],
-                        session["missing_observers"],
-                    )
-
-                    # Display results
-                    for expert, count in results.items():
-                        console.print(
-                            f"[green]Created {count} observations from {expert}[/green]"
-                        )
-
-                progress.update(task, advance=1)
-
-    if queue:
-        # Get queue items
-        conn, cursor = get_connection(config.database.path)
-        cursor.execute(
-            """
-            SELECT id, name, author, lifestage, filename, created_at 
-            FROM analysis_queue 
-            WHERE status = 'pending'
-            ORDER BY created_at
-        """
-        )
-        queue_items = cursor.fetchall()
-        conn.close()
-
-        if list:
-
-            if queue_items:
-                queue_table = Table(title="Document Analysis Queue")
-                queue_table.add_column("ID", style="cyan")
-                queue_table.add_column("Name", style="green")
-                queue_table.add_column("Author", style="blue")
-                queue_table.add_column("Life Stage", style="yellow")
-                queue_table.add_column("File", style="magenta")
-                queue_table.add_column("Created At", style="blue")
-
-                for item in queue_items:
-                    queue_table.add_row(
-                        item[0],
-                        item[1],
-                        item[2],
-                        item[3],
-                        str(Path(item[4]).name),
-                        item[5],
-                    )
-
-                console.print(queue_table)
+            item = cursor.fetchone()
+            conn.close()
+            
+            if not item:
+                console.print(f"[red]Queue item {queue_id} not found[/red]")
+                return
+            
+            metadata = json.loads(item[2]) if item[2] else {}
+            source_id = metadata.get('source_id')
+            
+            if not source_id:
+                console.print(f"[red]Queue item {queue_id} has no source_id in metadata[/red]")
+                return
+            
+            # Process the item
+            session_id = analysis_manager.run_analysis_on_source(source_id, queue_id, 
+                [observer.name for observer in config.roles.Observers])
+            
+            if session_id:
+                console.print(f"[green]Successfully analyzed queue item {queue_id}[/green]")
+                console.print(f"[green]Created session {session_id}[/green]")
+            else:
+                console.print(f"[red]Failed to analyze queue item {queue_id}[/red]")
+            
+        else:
+            # Process next queue item
+            console.print("[blue]Processing next item in the queue...[/blue]")
+            
+            if dryrun:
+                # Get next item for display
+                items = loader.get_queue_items(status="pending", limit=1)
+                if not items:
+                    console.print("[yellow]Queue is empty[/yellow]")
+                    return
+                
+                item = items[0]
+                console.print(f"[yellow]Would process: {item['name']} (ID: {item['id']})[/yellow]")
+                return
+            
+            session_id = analysis_manager.process_next_queue_item()
+            
+            if session_id:
+                console.print(f"[green]Successfully processed queue item, created session {session_id}[/green]")
+            else:
+                console.print("[yellow]No items in the queue or processing failed[/yellow]")
 
 
 @cli.command()
@@ -811,6 +782,133 @@ def consensus(ctx,
         else:
             reset_count = consensus_manager.reset_consensus_clusters(consensus_clusters)
             console.print(f"[green]Reset {reset_count} consensus records[/green]")
-                
+
+@cli.command()
+@click.argument("file_patterns", nargs=-1, type=click.Path())
+@click.option("--db", "db_path", type=click.Path(exists=True))
+@click.option("--name", "-n", help="Name template for the content (use {index} for batch)")
+@click.option("--author", "-a", help="Creator or source of the content")
+@click.option("--description", "-d", help="Description of the content (e.g., 'QA transcript with subject')")
+@click.option("--lifestage", "-l", type=click.Choice([
+    "CHILDHOOD", "ADOLESCENCE", "EARLY_ADULTHOOD", 
+    "EARLY_CAREER", "MID_CAREER", "LATE_CAREER", "AUTO"
+], case_sensitive=False), default="AUTO", help="Life stage for this content")
+@click.option("--priority", "-p", type=int, default=0, help="Processing priority (higher numbers = higher priority)")
+@click.option("--list", is_flag=True, help="List items in the queue")
+@click.option("--dryrun", is_flag=True, help="Show what would be loaded without making changes")
+@click.pass_context
+def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str], 
+         author: Optional[str], description: Optional[str], lifestage: Optional[str], 
+         priority: int, list: bool, dryrun: bool):
+    """
+    Add documents as sources, and update the queue.
+
+    FILE_PATTERNS are glob patterns for files to analyze (e.g. "docs/*.txt" "notes/**/*.md")
+    Multiple patterns can be provided to load multiple files.
+
+    For batch loading, use {index} in the name template, e.g. "Journal Entry {index}"
+
+    Author can be specified via --author flag or in config.yaml under content.default_author.
+    """
+    config = ctx.obj
+    if db_path:
+        config.database.path = db_path
+
+    author_name = author or config.content.default_author
+    if not author_name:
+        console.print(
+            "[red]Error: Author required. Specify with --author or set default_author in config[/red]"
+        )
+        return
+    
+    description = description or f"No description provided."
+      
+    # Create loader instance
+    loader = Loader(config)
+    
+    # Handle --list option - show queue contents
+    if list:
+        queue_items = loader.get_queue_items(status="pending")
+        
+        # Display queue contents
+        table = Table(title="Analysis Queue")
+        table.add_column("ID", style="cyan")
+        table.add_column("Title", style="green")
+        table.add_column("File", style="magenta")
+        table.add_column("Description", style="green")
+        table.add_column("Author", style="blue")
+        table.add_column("Life Stage", style="yellow")
+        table.add_column("Status", style="white")
+        table.add_column("Priority", style="red")
+        
+        for item in queue_items:
+            table.add_row(
+                item['id'], item['title'], os.path.basename(item['content_path']), item['description'],
+                item['author'],item['lifestage'], item['status'], str(item['priority'])
+            )
+            
+        console.print(table)
+        return
+    
+    # Require file patterns when not listing
+    if not file_patterns:
+        console.print("[red]Error: FILE_PATTERNS required when not using --list[/red]")
+        return
+    
+    # Resolve file patterns to get matched files
+    matched_files = resolve_file_patterns(file_patterns)
+    if not matched_files:
+        console.print("[yellow]No files matched the provided patterns[/yellow]")
+        return
+    
+    # Display files that will be processed
+    table = Table(title="Files to Load")
+    table.add_column("Index", style="cyan")
+    table.add_column("Title", style="green")
+    table.add_column("File", style="magenta")
+    table.add_column("Description", style="green")
+    table.add_column("Author", style="blue")
+    table.add_column("Life Stage", style="yellow")
+    
+    for idx, file_path in enumerate(matched_files, 1):
+        # Generate name if template provided
+        item_name = (
+            name.format(index=idx) if name and "{index}" in name
+            else name or os.path.splitext(os.path.basename(file_path))[0]
+        )
+
+        table.add_row(
+            str(idx), item_name, os.path.basename(file_path), description, author_name, lifestage
+        )
+    
+    console.print(table)
+    
+    if dryrun:
+        return
+    
+    # Process the files
+    result = loader.batch_load(
+        file_patterns=file_patterns,
+        name_template=name,
+        author=author,
+        description=description,
+        lifestage=lifestage,
+        priority=priority
+    )
+    
+    console.print(f"[green]Successfully loaded {len(result['loaded_files'])} of {len(matched_files)} files[/green]")
+    
+    # Show loaded file details
+    if result['loaded_files']:
+        details_table = Table(title="Loaded Files")
+        details_table.add_column("Name", style="green")
+        details_table.add_column("Source ID", style="cyan")
+        
+        for i, source_id in enumerate(result['source_ids']):
+            file_name = os.path.basename(result['loaded_files'][i])
+            details_table.add_row(file_name, source_id)
+            
+        console.print(details_table)
+
 if __name__ == "__main__":
     cli()
