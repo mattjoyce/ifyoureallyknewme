@@ -16,7 +16,7 @@ from typing import Dict, List, Optional, Tuple, Any, Union
 
 import numpy as np
 from .config import ConfigSchema
-from .utils import generate_id, timestamp
+from .utils import generate_id, timestamp,read_file_with_fallback_encodings
 from .embedding import get_embedding
 from .llm_calling import llm_process_with_prompt, get_role_prompt, extract_keywords
 from .database import get_connection
@@ -310,9 +310,10 @@ class AnalysisManager:
     ) -> List[Dict[str, Any]]:
         """
         Find sessions that haven't been analyzed by specified experts.
+
         """
         DB_PATH=self.config.database.path
-        logger.info(f"Checking sessions for observers: {', '.join(observer_names)}")
+        logger.debug(f"Checking sessions for observers: {', '.join(observer_names)}")
 
         try:
             conn, cursor = get_connection(DB_PATH)
@@ -326,17 +327,17 @@ class AnalysisManager:
             """
             )
 
+            sessions_with_missing_observers = []
             sessions = [dict(row) for row in cursor.fetchall()]
-            logger.info(f"Found {len(sessions)} sessions in database")
+            logger.debug(f"Found {len(sessions)} sessions in database")
 
             # For each session, check which experts have analyzed it
-            incomplete_sessions = 0
 
             for session in sessions:
                 session_id = session["id"]
                 session["missing_observers"] = []
 
-                logger.info(f"Checking session {session_id}: {session['title']}")
+                logger.debug(f"Checking session {session_id}: {session['title']}")
 
                 # First check distinct authors that have analyzed this session
                 cursor.execute(
@@ -349,7 +350,7 @@ class AnalysisManager:
                 )
 
                 existing_authors = [row[0] for row in cursor.fetchall()]
-                logger.info(
+                logger.debug(
                     f"Session {session_id} has been analyzed by: {', '.join(existing_authors or ['none'])}"
                 )
 
@@ -379,7 +380,7 @@ class AnalysisManager:
                 session["is_complete"] = len(session["missing_observers"]) == 0
 
                 if not session["is_complete"]:
-                    incomplete_sessions += 1
+                    sessions_with_missing_observers.append(session)
                     logger.debug(
                         f"Session {session_id} is incomplete, missing: {', '.join(session['missing_observers'])}"
                     )
@@ -387,10 +388,10 @@ class AnalysisManager:
                     logger.debug(f"Session {session_id} is complete")
 
             logger.info(
-                f"Found {incomplete_sessions} incomplete sessions out of {len(sessions)}"
+                f"Found {len(sessions_with_missing_observers)} incomplete sessions out of {len(sessions)}"
             )
             conn.close()
-            return sessions
+            return sessions_with_missing_observers
 
         except sqlite3.Error as e:
             logger.error(f"Error finding unanalyzed sessions: {str(e)}")
@@ -446,7 +447,8 @@ class AnalysisManager:
             file_path = session['file_path']
             if file_path and Path(file_path).exists():
                 try:
-                    source_content = Path(file_path).read_text(encoding="utf-8")
+                    source_content = read_file_with_fallback_encodings(file_path)
+                    #source_content = Path(file_path).read_text(encoding="utf-8")
                     context += source_content
                 except Exception as e:
                     raise IOError(f"Error reading content file: {str(e)}")
@@ -510,3 +512,23 @@ class AnalysisManager:
 
         return session_id
         
+
+    def update_queue_item_status(self, queue_id: str, status: str) -> bool:
+        """Update the status of a queue item to 'completed', 'failed', etc."""
+        try:
+            conn, cursor = get_connection(self.config.database.path)
+            cursor.execute(
+                """
+                UPDATE analysis_queue
+                SET status = ?
+                WHERE id = ?
+                """,
+                (status, queue_id)
+            )
+            conn.commit()
+            conn.close()
+            logger.info(f"Updated queue item {queue_id} status to {status}")
+            return True
+        except Exception as e:
+            logger.error(f"Error updating queue item status: {str(e)}")
+            return False

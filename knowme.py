@@ -100,11 +100,12 @@ def init(ctx, db_path: Optional[str]):
 @click.option("--db", "db_path", type=click.Path(exists=True), required=False)
 @click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
 @click.option("--queue-id", help="Process a specific queue item by ID")
+@click.option("--limit", "-l", type=int, default=1, help="Maximum number of queue items to process")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
 @click.option("--dryrun", is_flag=True, help="Dry run mode")
 @click.pass_context
 def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str], 
-            model: Optional[str], dryrun: bool):
+            limit  : int, model: Optional[str], dryrun: bool):
     """
     Run expert analysis on content in the queue.
     
@@ -154,8 +155,10 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
             if session_id:
                 console.print(f"[green]Successfully analyzed queue item {queue_id}[/green]")
                 console.print(f"[green]Created session {session_id}[/green]")
+                analysis_manager.update_queue_item_status(item['id'], 'completed')
             else:
                 console.print(f"[red]Failed to analyze queue item {queue_id}[/red]")
+                analysis_manager.update_queue_item_status(item['id'], 'failed')
 
             result=analysis_manager.run_multiple_role_analyses(session_id,observer_names)
             console.print(f"[blue]Results: {result} [/blue]")
@@ -165,7 +168,11 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
             # Process next queue item
             console.print("[blue]Processing next item in the queue...[/blue]")
             # Get next item
-            items = loader.get_queue_items(status="pending", limit=1)     
+
+
+
+
+            items = loader.get_queue_items(status="pending", limit=limit)     
             
             if not items:
                 console.print("[yellow]Queue is empty[/yellow]")
@@ -183,8 +190,10 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
 
                 if session_id:
                     console.print(f"[green]Successfully created session {session_id}[/green]")
+                    analysis_manager.update_queue_item_status(item['id'], 'completed')
                 else:
                     console.print("[yellow]No items in the queue or processing failed[/yellow]")
+                    analysis_manager.update_queue_item_status(item['id'], 'failed')
                 
                 # get sessions that are not yet analyzed
                 sessions=analysis_manager.get_unanalyzed_sessions(observer_names)
@@ -835,7 +844,6 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
     # Handle --list option - show queue contents
     if list:
         queue_items = loader.get_queue_items(status="pending")
-        
         # Display queue contents
         table = Table(title="Analysis Queue")
         table.add_column("ID", style="cyan")
@@ -852,7 +860,22 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
                 item['id'], item['title'], os.path.basename(item['content_path']), item['description'],
                 item['author'],item['lifestage'], item['status'], str(item['priority'])
             )
-            
+        console.print(table)
+
+
+        ## session with outstanding analysis
+        analysis_manager = AnalysisManager(config)
+        observer_names = [observer.name for observer in config.roles.Observers]
+        sessions = analysis_manager.get_unanalyzed_sessions(observer_names)
+        table = Table(title="Sessions with outstanding analysis")
+        table.add_column("ID", style="red")
+        table.add_column("Title", style="green")
+        table.add_column("Missing Observers", style="magenta")
+
+        for session in sessions:
+            table.add_row(
+                session['id'], session['title'], ', '.join(session['missing_observers']) )
+
         console.print(table)
         return
     

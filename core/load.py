@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .config import ConfigSchema
 from .database import get_connection
-from .utils import generate_id, resolve_file_patterns
+from .utils import generate_id, resolve_file_patterns, timestamp
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -32,7 +32,7 @@ class Loader:
         description: str,
         lifestage: str,
         priority: int = 0,
-    ) -> Optional[str]:
+    ) -> str:
         """
         Load a single file into the database and queue for analysis.
 
@@ -84,6 +84,7 @@ class Loader:
                         name,
                     ),
                 )
+                conn.commit()
                 logger.info(f"Successfully created source record: {source_id}")
 
                 # Queue for analysis
@@ -96,7 +97,7 @@ class Loader:
                 logger.info(
                     f"Successfully queued content into analysis queue: {queue_id}"
                 )
-                return source_id, queue_id
+                return source_id
 
             except Exception as e:
                 conn.rollback()
@@ -334,7 +335,10 @@ class Loader:
                 query += " WHERE aq.status = ?"
                 params.append(status)
             query += " ORDER BY aq.priority DESC, aq.created_at ASC"
-            query += f" LIMIT {limit}"
+
+
+            if limit>0:
+              query += f" LIMIT {limit}"
 
             cursor.execute(query, params)
 

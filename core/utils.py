@@ -102,3 +102,19 @@ def extract_json(content: str) -> Union[Dict, List]:
     
     raise ValueError("No valid JSON found in content")
 
+def read_file_with_fallback_encodings(file_path):
+    """Read a file with multiple encoding fallbacks."""
+    encodings = ['utf-8', 'latin-1', 'windows-1252', 'cp1252', 'ISO-8859-1']
+    
+    for encoding in encodings:
+        try:
+            with open(file_path, 'r', encoding=encoding) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    
+    # If all encodings fail, try binary mode as last resort
+    with open(file_path, 'rb') as f:
+        binary_content = f.read()
+        # Try to decode with errors='replace' to substitute invalid chars
+        return binary_content.decode('utf-8', errors='replace')
