@@ -987,6 +987,7 @@ def load(
 @cli.command()
 @click.argument("db_path", type=click.Path(exists=True), required=False)
 @click.option("--output", "-o", type=click.Path(), help="Output file path")
+@click.option("--dump", "-d", is_flag=True, help="Juest output the domain and content as JSON")
 @click.option(
     "--format",
     "-f",
@@ -1008,6 +1009,7 @@ def profile(
     output: Optional[str],
     format: str,
     mode: str,
+    dump: bool,
 ):
     """
     Generate a profile from the knowledge base.
@@ -1024,6 +1026,9 @@ def profile(
       - long: Detailed synthesized profile
     """
     config = ctx.obj
+    # Call the profile generator
+    from core.profile import ProfileGenerator
+    profile_generator = ProfileGenerator(config)
 
     # Apply overrides if provided
     if db_path:
@@ -1036,15 +1041,15 @@ def profile(
         )
         return
 
+    if dump:
+        print(profile_generator.dump_observations())
+        return
+
+
     if format == "raw":
         console.print("[blue]Generating raw knowledge records...[/blue]")
     else:
         console.print(f"[blue]Generating {mode} profile in {format} format...[/blue]")
-
-    # Call the profile generator
-    from core.profile import ProfileGenerator
-
-    profile_generator = ProfileGenerator(config)
 
     try:
         with Progress() as progress:
