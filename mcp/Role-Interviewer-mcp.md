@@ -53,4 +53,4 @@ Use markdown formatting for the transcript:
 
 Continue this pattern throughout the transcript, ensuring accurate representation of the conversation.
 
-your Seed Question is : {{question}}
+Tool:Get A Random Question
