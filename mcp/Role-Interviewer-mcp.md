@@ -50,7 +50,10 @@ Use markdown formatting for the transcript:
 
 **Subject**: [Response]
 ```
-
 Continue this pattern throughout the transcript, ensuring accurate representation of the conversation.
+Produce a markdown file with the following naming convention:
+Transcript-yyyy-mm-dd-hh-mm.md
 
-Tool:Get A Random Question
+# Recommended Tools
+Get A Random Question
+Start Timer
