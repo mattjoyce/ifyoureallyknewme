@@ -199,13 +199,13 @@ def get_random_question(domain: Optional[str] = None) -> str:
     logger.info(f"Returning random question: {question[:30]}...")
     return question
 
-@mcp.resource("questions://domains")
+@mcp.tool()
 def get_domains() -> str:
     """Get a list of available domains.  Used to ask domain specific questions."""
     domains = get_available_domains(QUESTIONS)
     return "\n".join(domains)
 
-@mcp.resource("coverage_report://latest")
+@mcp.tool()
 def get_latest_report() -> str:
     """Get the latest version of the coverage report, used to learn which domain should be covered next."""
     return get_coverage_report()
