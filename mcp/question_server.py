@@ -90,6 +90,53 @@ def get_all_questions() -> str:
     """Get all questions as a formatted list."""
     return "\n\n".join([f"{i+1}. {q}" for i, q in enumerate(QUESTIONS)])
 
+# Prompts
+@mcp.prompt(name="ConductInterview", description="Conduct an interview.")
+def conduct_interview() -> list:
+    """
+    Conduct an interview using a random question.
+    """
+    logger.info("Prompt Requested: ConductInterview")
+    question = get_random_question()
+    
+    try:
+        with open("../roles/Role-Interviewer-mcp.md") as f:
+            system_prompt = f.read()
+        
+        # Replace placeholder with the actual question
+        system_prompt = system_prompt.replace("{{question}}", question)
+        
+        # Return properly formatted MCP prompt structure
+        return [
+            {
+                "role": "system",
+                "content": {
+                    "type": "text",
+                    "text": system_prompt
+                }
+            },
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": "Let's start the interview with the question above."
+                }
+            }
+        ]
+    except Exception as e:
+        logger.error(f"Error loading interviewer role: {e}")
+        # Fallback if role file isn't available
+        return [
+            {
+                "role": "user",
+                "content": {
+                    "type": "text",
+                    "text": f"You are an interviewer. Ask me this question: {question}"
+                }
+            }
+        ]
+
+
 # Run the server
 if __name__ == "__main__":
     logger.info(f"Starting question server with {len(QUESTIONS)} questions")
