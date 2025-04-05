@@ -111,7 +111,7 @@ def conduct_interview() -> dict:
     question = get_random_question()
     
     try:
-        with open("Role-Interviewer-mcp.md") as f:
+        with open("Role-Interviewer-mcp.md", "r",encoding="utf-8") as f:
             interviewer_role = f.read()
         
         # Replace placeholder with the actual question
@@ -120,13 +120,8 @@ def conduct_interview() -> dict:
         # Return a dictionary with the interviewer configuration
         return {
             "interviewer_role": interviewer_role,
-            "question": question,
-            "emojis": {
-                "interviewer": "👨‍💼📋",
-                "initial_question": "🤔",
-                "follow_up": "🔍"
             }
-        }
+        
     except Exception as e:
         logger.error(f"Error loading interviewer role: {e}")
         # Fallback if role file isn't available
