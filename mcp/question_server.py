@@ -37,7 +37,6 @@ logger.info(f"Logging to file: {log_file_path}")
 @dataclass
 class Question:
     """Simple class for storing a domain question."""
-
     QID: str
     domain: str
     text: str
@@ -195,9 +194,13 @@ def get_random_question(domain: Optional[str] = None) -> str:
     """Get a random question for a specific domain, or pick from the Non-Domain questions."""
     if not QUESTIONS:
         return "No questions available."
-    question = random.choice(QUESTIONS)
-    logger.info(f"Returning random question: {question[:30]}...")
-    return question
+    
+    question_text = get_question_by_domain(domain, QUESTIONS)
+    if question_text:
+        logger.info(f"Returning domain-specific question: {question_text[:30]}...")
+        return question_text
+    else:
+        return f"No questions found for domain: {domain}"
 
 @mcp.tool()
 def get_domains() -> str:
