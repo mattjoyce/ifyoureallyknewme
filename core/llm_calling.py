@@ -121,7 +121,7 @@ def llm_process_with_prompt(config:ConfigSchema,
     response = call_llm_with_prompt(input_content, prompt, model, json_output=expect_json)
     
     # Debug the response
-    logger.info(f"Response from call_llm_with_prompt type: {type(response)}")
+    logger.debug(f"Response from call_llm_with_prompt type: {type(response)}")
     
     # If response is already a dict or list, return it directly
     if isinstance(response, (dict, list)):

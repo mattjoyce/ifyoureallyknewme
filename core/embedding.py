@@ -5,6 +5,7 @@ Provides common functionality for generating and comparing text embeddings.
 
 import os
 import numpy as np
+import base64
 from typing import List, Tuple, Union, Optional
 from pathlib import Path
 from openai import OpenAI
@@ -55,6 +56,28 @@ def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
         return 0.0
         
     return float(np.dot(v1, v2) / (norm1 * norm2))
+
+def cosine_similarity_base64(a: str, b: str, dtype=np.float32) -> float:
+    """Compute cosine similarity between two base64 encoded vectors.
+
+    Args:
+        a: Base64 encoded vector
+        b: Base64 encoded vector
+        dtype: The data type of the vector (default: np.float32)
+
+    Returns:
+        Cosine similarity (0-1)
+    """
+    try:
+        a_bytes = base64.b64decode(a)
+        b_bytes = base64.b64decode(b)
+        a_array = np.frombuffer(a_bytes, dtype=dtype)
+        b_array = np.frombuffer(b_bytes, dtype=dtype)
+        return cosine_similarity(a_array, b_array)
+    except (ValueError, TypeError) as e:
+        print(f"Error computing cosine similarity: {e}")
+        return 0.0 # Return 0 if there is an error.
+
 
 def compute_pairwise_similarities(embeddings: List[np.ndarray]) -> np.ndarray:
     """Compute pairwise cosine similarities between multiple embeddings.

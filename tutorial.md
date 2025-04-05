@@ -31,33 +31,33 @@ It attempts to attribute facts and observations to a life stage and knowledge do
 - Active Projects and Learning
 
 ## Technical
-- written in phyton
+- written in python
 - uses SQLite3 as the database
 - uses openai for embeddings
-- uses fabric for llm calls (this can be changed)
+- uses Simon Wilson's llm library calls (this can be changed)
 
 ## Getting Started
 
 The main application is CLI only and is called *knowme.py*
 
-```bash
-❯ python3 knowme.py --help
 Usage: knowme.py [OPTIONS] COMMAND [ARGS]...
 
   KnowMe - Personal knowledge management and analysis system.
 
 Options:
-  --version      Show the version and exit.
-  --config PATH  Path to config file
-  --help         Show this message and exit.
+  --version       Show the version and exit.
+  --config PATH   Path to config file
+  --db-path PATH  Override database path from config
+  --model TEXT    Override LLM model from config
+  --help          Show this message and exit.
 
 Commands:
-  analyze  Run expert analysis on content.
-  init     Initialize a new knowledge database.
-  merge    Find clusters of similar notes/facts and create consensus...
-  profile  Generate a profile from the knowledge base.
-  queue    Add content to the analysis queue or process QA transcripts.
-```
+  analyze    Run expert analysis on content in the queue.
+  consensus  Manage consensus records.
+  init       Initialize a new knowledge database.
+  load       Add documents as sources, and update the queue.
+  merge      Find clusters of similar notes/facts and create consensus...
+  profile    Generate a profile from the knowledge base.
 
 
 It uses a yaml config file, here's an example.
@@ -110,19 +110,24 @@ logging:
 
 ```
 
-My advice is you create a private folder, and use that for you files you'll be uploading and the database.
+My advice is to create a private folder, and use that for you files you'll be uploading and the database.
 Ok, let's start a new database.
 
 ```bash
 python3 knowme.py --config test_config.yaml init
 ```
 
-ok, use a text editor, and copy the qa-template.md to your private folder.
-Edit it, and answer the question as fully as you can.
 
-Let's load that QA document into the system.
+Use a text editor (Text for Life!) to create a document your want to load.
+For example start with this seed question, spend 15 minutes really getting detailed.
+
+"Tell me the story of your life. Start from the beginning -- from your childhood, to education, to family and relationships, and to any major life events you may have had."
+
+Put that at the top of the document and then put your answer underneath.
+Save your file and let's load it into the system.
 
 ```bash
 
 ```
-
+```
+```

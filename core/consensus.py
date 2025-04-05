@@ -125,60 +125,6 @@ class ConsensusManager:
         return records_to_reset
 
 
-    def reset_consensus_clusters(self, consensus_clusters: Dict[str, Any]) -> int:
-        """Reset similar consensus records by unlinking their source records.
-        
-        Args:
-            consensus_clusters: Result of find_similar_consensus()
-            
-        Returns:
-            Number of consensus records reset
-        """
-        if not consensus_clusters:
-            return 0
-        
-        DB_PATH = self.config.database.path
-        conn, cursor = get_connection(DB_PATH)
-        
-        try:
-            reset_count = 0
-            
-            for cluster_id, cluster in consensus_clusters.items():
-                consensus_ids = cluster["consensus_ids"]
-                
-                # Format for SQL query
-                id_placeholders = ','.join(['?'] * len(consensus_ids))
-                
-                # First get all source records linked to these consensus records
-                cursor.execute(f"""
-                    SELECT id FROM knowledge_records
-                    WHERE consensus_id IN ({id_placeholders})
-                """, consensus_ids)
-                
-                source_ids = [row[0] for row in cursor.fetchall()]
-                logger.info(f"Found {len(source_ids)} source records linked to {len(consensus_ids)} consensus records")
-                
-                # Reset consensus_id for all linked records
-                if source_ids:
-                    cursor.execute(f"""
-                        UPDATE knowledge_records
-                        SET consensus_id = NULL
-                        WHERE id IN ({','.join(['?'] * len(source_ids))})
-                    """, source_ids)
-                
-                # Delete the consensus records
-                cursor.execute(f"""
-                    DELETE FROM knowledge_records
-                    WHERE id IN ({id_placeholders})
-                """, consensus_ids)
-                
-                reset_count += len(consensus_ids)
-            
-            conn.commit()
-            return reset_count
-            
-        finally:
-            conn.close()
 
     def find_clusters(
         self, threshold: float = 0.85, record_type: str = "note"
@@ -381,8 +327,10 @@ class ConsensusManager:
         # Find clusters
         clusters = self.find_clusters(threshold, kr_type)
 
-        if not clusters:
-            return {"clusters": {}, "consensus_count": 0, "cluster_count": 0}
+        if self.config.dryrun:
+            logger.info("Dry run mode enabled, skipping consensus processing")
+            return {"clusters": clusters}
+        
 
         # Process consensus if not in dryrun mode
         consensus_ids = []  # This will store actual IDs as separate items
@@ -447,3 +395,26 @@ class ConsensusManager:
             }
 
         return result
+    
+    def reset_consensus(self) -> int:
+        """Dete consensus records and unoink consensus_id from knowledge records."""
+        DB_PATH = self.config.database.path
+        conn, cursor = get_connection(DB_PATH)
+        
+        try:
+            cursor.execute("SELECT COUNT(*) FROM knowledge_records WHERE consensus_id IS NOT NULL")
+            initial_count = cursor.fetchone()[0]
+            
+            cursor.execute("UPDATE knowledge_records SET consensus_id = NULL WHERE consensus_id IS NOT NULL")
+            conn.commit()
+            
+            cursor.execute("DELETE FROM knowledge_records WHERE author = 'ConsensusMaker' AND type = 'consensus'")
+            conn.commit()
+            
+            cursor.execute("SELECT COUNT(*) FROM knowledge_records WHERE consensus_id IS NOT NULL")
+            final_count = cursor.fetchone()[0]
+            
+            return final_count - initial_count
+        
+        finally:
+            conn.close()

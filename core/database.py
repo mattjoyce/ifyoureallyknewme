@@ -7,8 +7,11 @@ import logging
 import os
 import json
 import sqlite3
+import base64
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any, Union
+from pydantic import BaseModel, Field
+
 
 
 from .config import ConfigSchema
@@ -16,6 +19,95 @@ from .config import ConfigSchema
 # Get logger
 logger = logging.getLogger(__name__)
 
+class KnowledgeRecord(BaseModel):
+    id: str
+    type: str
+    domain: Optional[str] = Field(default=None)
+    author: Optional[str] = Field(default=None)
+    content: dict
+    created_at: Optional[str] = Field(default=None)
+    version: Optional[str] = Field(default=None)
+    consensus_id: Optional[str] = Field(default=None)
+    session_id: Optional[str] = Field(default=None)
+    qa_id: Optional[str] = Field(default=None)
+    source_id: Optional[str] = Field(default=None)
+    keywords: Optional[str] = Field(default=None)
+    embedding: Optional[str] = Field(default=None) # blob #Base64 string
+
+def get_filtered_knowledge_records(
+    config: ConfigSchema,
+    session_id: Optional[str] = None,
+    domain: Optional[List[str]] = None,
+    confidence: Optional[List[str]] = None,
+    lifestage: Optional[List[str]] = None,
+    observation_text: Optional[List[str]] = None,
+    type: Optional[str] = None,
+    author: Optional[str] = None,
+    consensus_id: Optional[str] = None,
+    qa_id: Optional[str] = None,
+    source_id: Optional[str] = None,
+    embedding: bool = False
+) -> List[KnowledgeRecord]:
+    conn, cursor = get_connection(config.database.path)
+
+    if embedding:
+        query = "SELECT id, type, domain, author, content, created_at, version, consensus_id, session_id, qa_id, source_id, keywords, embedding FROM knowledge_records WHERE 1=1"
+    else:
+        query = "SELECT id, type, domain, author, content, created_at, version, consensus_id, session_id, qa_id, source_id, keywords FROM knowledge_records WHERE 1=1"
+
+    params = []
+    if session_id:
+        query += " AND session_id = ?"
+        params.append(session_id)
+    if type:
+        query += " AND type = ?"
+        params.append(type)
+    if author:
+        query += " AND author = ?"
+        params.append(author)
+    if consensus_id:
+        query += " AND consensus_id = ?"
+        params.append(consensus_id)
+    if qa_id:
+        query += " AND qa_id = ?"
+        params.append(qa_id)
+    if source_id:
+        query += " AND source_id = ?"
+        params.append(source_id)
+    cursor.execute(query, params)
+    results = cursor.fetchall()
+    records = []
+    for row in results:
+        try:
+            content = json.loads(row[4])
+
+            embedding_base64 = base64.b64encode(row[12]).decode("utf-8") if embedding else None
+
+            record = KnowledgeRecord(
+                id=row[0],
+                type=row[1],
+                domain=row[2],
+                author=row[3],
+                content=content,
+                created_at=row[5],
+                version=row[6],
+                consensus_id=row[7],
+                session_id=row[8],
+                qa_id=row[9],
+                source_id=row[10],
+                keywords=row[11],
+                embedding=embedding_base64,
+            )
+            domain_filter = not domain or any(d.lower() in record.content.get("domain", "").lower() for d in domain)
+            confidence_filter = not confidence or any(c.lower() in record.content.get("confidence", "").lower() for c in confidence)
+            lifestage_filter = not lifestage or any(ls.lower() in record.content.get("life_stage", "").lower() for ls in lifestage)
+            observation_filter = not observation_text or any(ot.lower() in record.content.get("observation", "").lower() for ot in observation_text)
+            if domain_filter and confidence_filter and lifestage_filter and observation_filter:
+                records.append(record)
+        except json.JSONDecodeError:
+            print(f"Error decoding JSON: {row[4]}")
+    conn.close()
+    return records
 
 def create_database(config:ConfigSchema, db_path: Optional[str] = None) -> bool:
     """
@@ -153,3 +245,5 @@ def store_knowledge_record(config : ConfigSchema,
     conn.commit()
     logger.info(f"Successfully stored knowledge record: {note_id}")
     conn.close()
+
+

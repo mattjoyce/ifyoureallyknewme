@@ -54,7 +54,7 @@ def cli(ctx, config: Optional[str], db_path: Optional[str], model: Optional[str]
     if db_path:
         cfg.database.path = db_path
         console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-    
+
     if model:
         cfg.llm.generative_model = model
         console.print(f"[blue]Overriding LLM model: {model}[/blue]")
@@ -100,15 +100,28 @@ def init(ctx, db_path: Optional[str]):
 @click.option("--db", "db_path", type=click.Path(exists=True), required=False)
 @click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
 @click.option("--queue-id", help="Process a specific queue item by ID")
-@click.option("--limit", "-l", type=int, default=1, help="Maximum number of queue items to process")
+@click.option(
+    "--limit",
+    "-l",
+    type=int,
+    default=1,
+    help="Maximum number of queue items to process",
+)
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
 @click.option("--dryrun", is_flag=True, help="Dry run mode")
 @click.pass_context
-def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str], 
-            limit  : int, model: Optional[str], dryrun: bool):
+def analyze(
+    ctx,
+    db_path: Optional[str],
+    queue: bool,
+    queue_id: Optional[str],
+    limit: int,
+    model: Optional[str],
+    dryrun: bool,
+):
     """
     Run expert analysis on content in the queue.
-    
+
     If --queue is provided, processes the next pending item in the queue.
     If --queue-id is provided, processes that specific queue item.
     """
@@ -116,101 +129,109 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
     # Apply overrides if provided
     if db_path:
         config.database.path = db_path
-    
+
     if model:
         config.llm.generative_model = model
-    
+
     if dryrun:
         config.dryrun = True
-    
+
     observer_names = [observer.name for observer in config.roles.Observers]
 
     analysis_manager = AnalysisManager(config)
-    
+
     if queue or queue_id:
         loader = Loader(config)
-        
+
         if queue_id:
             # Process specific queue item
             console.print(f"[blue]Processing queue item {queue_id}[/blue]")
 
+            item = loader.get_source_and_queue_item(queue_id=queue_id)
 
-            item=loader.get_source_and_queue_item(queue_id=queue_id)
-       
             if not item:
                 console.print(f"[red]Source Queue item {queue_id} not found[/red]")
                 return
-            
+
             logging.info(f"source_id: {item['source_id']}")
 
-
-            if not item['source_id']:
-                console.print(f"[red]Queue item {queue_id} has no source_id in metadata[/red]")
+            if not item["source_id"]:
+                console.print(
+                    f"[red]Queue item {queue_id} has no source_id in metadata[/red]"
+                )
                 return
-            
+
             # Process the item
             session_id = analysis_manager.create_session(item)
             logger.info(f"Process the item - session_id: {session_id}")
-                                                                       
+
             if session_id:
-                console.print(f"[green]Successfully analyzed queue item {queue_id}[/green]")
+                console.print(
+                    f"[green]Successfully analyzed queue item {queue_id}[/green]"
+                )
                 console.print(f"[green]Created session {session_id}[/green]")
-                analysis_manager.update_queue_item_status(item['id'], 'completed')
+                analysis_manager.update_queue_item_status(item["id"], "completed")
             else:
                 console.print(f"[red]Failed to analyze queue item {queue_id}[/red]")
-                analysis_manager.update_queue_item_status(item['id'], 'failed')
+                analysis_manager.update_queue_item_status(item["id"], "failed")
 
-            result=analysis_manager.run_multiple_role_analyses(session_id,observer_names)
+            result = analysis_manager.run_multiple_role_analyses(
+                session_id, observer_names
+            )
             console.print(f"[blue]Results: {result} [/blue]")
             return
-            
+
         else:
             # Process next queue item
             console.print("[blue]Processing next item in the queue...[/blue]")
             # Get next item
 
+            items = loader.get_queue_items(status="pending", limit=limit)
 
-
-
-            items = loader.get_queue_items(status="pending", limit=limit)     
-            
             if not items:
                 console.print("[yellow]Queue is empty[/yellow]")
                 return
 
-            #each queue item is a dictionary
+            # each queue item is a dictionary
             for item in items:
 
                 if dryrun:
-                    console.print(f"[yellow]Would process: {item['title']} (ID: {item['id']})[/yellow]")
+                    console.print(
+                        f"[yellow]Would process: {item['title']} (ID: {item['id']})[/yellow]"
+                    )
                     return
-                    
+
                 # create a session for the item
                 session_id = analysis_manager.create_session(item)
 
                 if session_id:
-                    console.print(f"[green]Successfully created session {session_id}[/green]")
-                    analysis_manager.update_queue_item_status(item['id'], 'completed')
+                    console.print(
+                        f"[green]Successfully created session {session_id}[/green]"
+                    )
+                    analysis_manager.update_queue_item_status(item["id"], "completed")
                 else:
-                    console.print("[yellow]No items in the queue or processing failed[/yellow]")
-                    analysis_manager.update_queue_item_status(item['id'], 'failed')
-                
+                    console.print(
+                        "[yellow]No items in the queue or processing failed[/yellow]"
+                    )
+                    analysis_manager.update_queue_item_status(item["id"], "failed")
+
                 # get sessions that are not yet analyzed
-                sessions=analysis_manager.get_unanalyzed_sessions(observer_names)
+                sessions = analysis_manager.get_unanalyzed_sessions(observer_names)
                 console.print(f"[blue]Sessions: {sessions} for analysis [/blue]")
 
                 # run analysis on the sessions
                 for session in sessions:
-                    results=analysis_manager.run_multiple_role_analyses(session['id'], observer_names)
+                    results = analysis_manager.run_multiple_role_analyses(
+                        session["id"], observer_names
+                    )
                     console.print(f"[blue]Results: {results} [/blue]")
-
-
 
 
 @cli.command()
 @click.option("--threshold", "-t", default=0.85, help="Similarity threshold (0-1)")
 @click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option("--dryrun", "dryrun",is_flag=True, help="Dry run mode")
+@click.option("--dryrun", "dryrun", is_flag=True, help="Dry run mode")
+@click.option("--reset", is_flag=True, help="Reset all consensus records")
 @click.option(
     "--type",
     "kr_type",
@@ -221,10 +242,12 @@ def analyze(ctx, db_path: Optional[str], queue: bool, queue_id: Optional[str],
 @click.option("--list", "-l", is_flag=True, help="List clusters without merging")
 @click.option("--model", "-m", help="LLM model to use (default: from config)")
 @click.pass_context
-def merge(ctx,
+def merge(
+    ctx,
     db_path: Optional[str],
     threshold: float,
     dryrun: bool,
+    reset: bool,
     kr_type: str,
     list: bool,
     model: Optional[str],
@@ -235,26 +258,49 @@ def merge(ctx,
     Uses semantic similarity to group related observations and create
     higher-level consensus statements.
     """
-
     config = ctx.obj
+
+    # Initialize the consensus manager
+    consensus_manager = ConsensusManager(config)
+
     # Apply overrides if provided
     if db_path:
         config.database.path = db_path
         console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-    
+
     if model:
         config.llm.generative_model = model
         console.print(f"[blue]Overriding LLM model: {model}[/blue]")
 
     if dryrun:
         config.dryrun = True
+    else:
+        config.dryrun = False
 
-    # Initialize the consensus manager
-    consensus_manager = ConsensusManager(config)
+
+
+    if reset:
+        console.print("[yellow]Resetting all consensus records...[/yellow]")
+        result = consensus_manager.reset_consensus()
+        console.print(f"[green]Reset {result} consensus records[/green]")
+        return
+
+    result = consensus_manager.process_clusters(threshold=threshold, kr_type=kr_type)
+
+    if dryrun:
+        ## loop through each cluster and print out the observations
+        for cluster_id, cluster_info in result["clusters"].items():
+                print(f"{cluster_id}")
+                
+                notes = cluster_info.get('notes', [])
+                for note in notes:
+                    observation = note.get('observation', 'No observation')
+                    print(f"  {observation}")
+                print() 
+        return
 
     if list:
         # Just list clusters without creating consensus
-
 
         # Create a table to display clusters
         table = Table(title=f"Observation Clusters (threshold={threshold})")
@@ -290,10 +336,6 @@ def merge(ctx,
     console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
 
     try:
-        result = consensus_manager.process_clusters(
-            threshold=threshold, kr_type=kr_type
-        )
-
         if not result["clusters"]:
             console.print(
                 "[yellow]No clusters found with the current threshold.[/yellow]"
@@ -317,72 +359,6 @@ def merge(ctx,
     except Exception as e:
         console.print(f"[red]Error during consensus processing: {str(e)}[/red]")
         logging.exception("Error during consensus processing")
-
-
-@cli.command()
-@click.argument("db_path", type=click.Path(exists=True), required=False)
-@click.option("--output", "-o", type=click.Path(), help="Output file path")
-@click.option(
-    "--format",
-    "-f",
-    type=click.Choice(["text", "md", "html", "json"], case_sensitive=False),
-    default="md",
-    help="Output format",
-)
-@click.option(
-    "--mode",
-    "-m",
-    type=click.Choice(
-        ["short", "long"], case_sensitive=False
-    ),
-    default="short",
-    help="Length of profile",
-)
-@click.pass_context
-def profile(ctx,
-    db_path: Optional[str],
-    output: Optional[str],
-    format: str,
-    mode: str,
-):
-    """
-    Generate a profile from the knowledge base.
-
-    Creates a formatted profile document based on consensus records
-    and notes, tailored to the specified audience.
-    """
-
-    config = ctx.obj
-    # Apply overrides if provided
-    if db_path:
-        config.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-    
-    if not db_path:
-        console.print(
-            f"[red]Error: No database path provided and not found in configuration {config.database.path}[/red]"
-        )
-        return
-
-    console.print(f"[blue]Generating {mode} profile in {format} format...[/blue]")
-
-    # TODO: Call core function to generate profile
-    # from core.profile import generate_profile
-    # profile_content = generate_profile(db_path, session, format, audience)
-
-    # Placeholder implementation
-    profile_content = (
-        f"# Sample Profile\n\nThis is a {mode} profile in {format} format."
-    )
-
-    # Output the profile
-    if output:
-        with open(output, "w") as f:
-            f.write(profile_content)
-        console.print(f"[green]Profile written to {output}[/green]")
-    else:
-        console.print("\n[bold]Profile:[/bold]\n")
-        console.print(Panel(profile_content))
 
 
 @cli.command()
@@ -422,7 +398,8 @@ def profile(ctx,
     "--dryrun", is_flag=True, help="Show what would be queued without making changes"
 )
 @click.pass_context
-def queue(ctx,
+def queue(
+    ctx,
     db_path: Optional[str],
     file_patterns: tuple,
     name: Optional[str],
@@ -455,7 +432,7 @@ def queue(ctx,
     if db_path:
         config.database.path = db_path
         console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-    
+
     # List mode is dominant mode. If --list is provided, ignore other options.
 
     ## ANALYSIS QUEUE tabel is for documents not sessions
@@ -712,10 +689,15 @@ def queue(ctx,
 @click.option("--threshold", "-t", default=0.92, help="Similarity threshold (0-1)")
 @click.option("--db", "db_path", type=click.Path(exists=True), required=False)
 @click.option("--reset", "-r", is_flag=True, help="Reset similar consensus records")
-@click.option("--dryrun", is_flag=True, help="Show what would be reset without making changes")
-@click.option("--no-list", is_flag=True, help="Skip detailed listing of consensus records")
+@click.option(
+    "--dryrun", is_flag=True, help="Show what would be reset without making changes"
+)
+@click.option(
+    "--no-list", is_flag=True, help="Skip detailed listing of consensus records"
+)
 @click.pass_context
-def consensus(ctx,
+def consensus(
+    ctx,
     db_path: Optional[str],
     threshold: float,
     reset: bool,
@@ -724,35 +706,39 @@ def consensus(ctx,
 ):
     """
     Manage consensus records.
-    
+
     Find similar consensus records that might need to be reset.
     By default, shows a list of similar consensus record clusters.
-    
+
     Use --reset to reset the similar consensus records, unlinking their
     source records to allow re-clustering.
-    
+
     Use --dryrun with --reset to see what would be reset without making changes.
-    
+
     Use --no-list to skip the detailed listing (useful for scripts).
     """
     config = ctx.obj
     if db_path:
         config.database.path = db_path
         console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-    
+
     if dryrun:
         config.dryrun = True
-    
+
     consensus_manager = ConsensusManager(config)
-    
+
     # Find similar consensus records
-    console.print(f"[blue]Finding similar consensus records with threshold {threshold}...[/blue]")
+    console.print(
+        f"[blue]Finding similar consensus records with threshold {threshold}...[/blue]"
+    )
     consensus_clusters = consensus_manager.find_similar_consensus(threshold)
-    
+
     if not consensus_clusters:
-        console.print("[yellow]No similar consensus records found with the current threshold.[/yellow]")
+        console.print(
+            "[yellow]No similar consensus records found with the current threshold.[/yellow]"
+        )
         return
-    
+
     # Display results unless --no-list is specified
     if not no_list:
         table = Table(title=f"Similar Consensus Records (threshold={threshold})")
@@ -761,60 +747,104 @@ def consensus(ctx,
         table.add_column("Avg. Similarity", style="yellow", justify="right")
         table.add_column("Records", style="magenta")
         table.add_column("Sample Observation", style="white")
-        
+
         total_records = 0
         for cluster_id, cluster in consensus_clusters.items():
-            record_ids = ", ".join(cluster["consensus_ids"][:3]) 
+            record_ids = ", ".join(cluster["consensus_ids"][:3])
             if len(cluster["consensus_ids"]) > 3:
                 record_ids += f"... (+{len(cluster['consensus_ids']) - 3} more)"
-                
+
             # Truncate sample observation if too long
             sample = cluster["observations"][0]
             if len(sample) > 60:
                 sample = sample[:57] + "..."
-                
+
             table.add_row(
                 cluster_id,
                 str(cluster["observation_count"]),
                 f"{cluster['average_similarity']:.2f}",
                 record_ids,
-                sample
+                sample,
             )
             total_records += cluster["observation_count"]
-        
+
         console.print(table)
-        console.print(f"[blue]Found {len(consensus_clusters)} clusters containing {total_records} consensus records[/blue]")
-    
+        console.print(
+            f"[blue]Found {len(consensus_clusters)} clusters containing {total_records} consensus records[/blue]"
+        )
+
     # Reset if requested
     if reset:
         total_count = sum(c["observation_count"] for c in consensus_clusters.values())
-        
+
         if dryrun:
-            console.print(f"[yellow]Would reset {total_count} consensus records in {len(consensus_clusters)} clusters[/yellow]")
+            console.print(
+                f"[yellow]Would reset {total_count} consensus records in {len(consensus_clusters)} clusters[/yellow]"
+            )
             # Show what would happen to each cluster
             for cluster_id, cluster in consensus_clusters.items():
-                console.print(f"  - Cluster {cluster_id}: {cluster['observation_count']} records would be reset")
+                console.print(
+                    f"  - Cluster {cluster_id}: {cluster['observation_count']} records would be reset"
+                )
         else:
             reset_count = consensus_manager.reset_consensus_clusters(consensus_clusters)
             console.print(f"[green]Reset {reset_count} consensus records[/green]")
 
+
 @cli.command()
 @click.argument("file_patterns", nargs=-1, type=click.Path())
 @click.option("--db", "db_path", type=click.Path(exists=True))
-@click.option("--name", "-n", help="Name template for the content (use {index} for batch)")
+@click.option(
+    "--name", "-n", help="Name template for the content (use {index} for batch)"
+)
 @click.option("--author", "-a", help="Creator or source of the content")
-@click.option("--description", "-d", help="Description of the content (e.g., 'QA transcript with subject')")
-@click.option("--lifestage", "-l", type=click.Choice([
-    "CHILDHOOD", "ADOLESCENCE", "EARLY_ADULTHOOD", 
-    "EARLY_CAREER", "MID_CAREER", "LATE_CAREER", "AUTO"
-], case_sensitive=False), default="AUTO", help="Life stage for this content")
-@click.option("--priority", "-p", type=int, default=0, help="Processing priority (higher numbers = higher priority)")
+@click.option(
+    "--description",
+    "-d",
+    help="Description of the content (e.g., 'QA transcript with subject')",
+)
+@click.option(
+    "--lifestage",
+    "-l",
+    type=click.Choice(
+        [
+            "CHILDHOOD",
+            "ADOLESCENCE",
+            "EARLY_ADULTHOOD",
+            "EARLY_CAREER",
+            "MID_CAREER",
+            "LATE_CAREER",
+            "AUTO",
+        ],
+        case_sensitive=False,
+    ),
+    default="AUTO",
+    help="Life stage for this content",
+)
+@click.option(
+    "--priority",
+    "-p",
+    type=int,
+    default=0,
+    help="Processing priority (higher numbers = higher priority)",
+)
 @click.option("--list", is_flag=True, help="List items in the queue")
-@click.option("--dryrun", is_flag=True, help="Show what would be loaded without making changes")
+@click.option(
+    "--dryrun", is_flag=True, help="Show what would be loaded without making changes"
+)
 @click.pass_context
-def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str], 
-         author: Optional[str], description: Optional[str], lifestage: Optional[str], 
-         priority: int, list: bool, dryrun: bool):
+def load(
+    ctx,
+    db_path: Optional[str],
+    file_patterns: tuple,
+    name: Optional[str],
+    author: Optional[str],
+    description: Optional[str],
+    lifestage: Optional[str],
+    priority: int,
+    list: bool,
+    dryrun: bool,
+):
     """
     Add documents as sources, and update the queue.
 
@@ -835,12 +865,12 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
             "[red]Error: Author required. Specify with --author or set default_author in config[/red]"
         )
         return
-    
+
     description = description or f"No description provided."
-      
+
     # Create loader instance
     loader = Loader(config)
-    
+
     # Handle --list option - show queue contents
     if list:
         queue_items = loader.get_queue_items(status="pending")
@@ -854,14 +884,19 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
         table.add_column("Life Stage", style="yellow")
         table.add_column("Status", style="white")
         table.add_column("Priority", style="red")
-        
+
         for item in queue_items:
             table.add_row(
-                item['id'], item['title'], os.path.basename(item['content_path']), item['description'],
-                item['author'],item['lifestage'], item['status'], str(item['priority'])
+                item["id"],
+                item["title"],
+                os.path.basename(item["content_path"]),
+                item["description"],
+                item["author"],
+                item["lifestage"],
+                item["status"],
+                str(item["priority"]),
             )
         console.print(table)
-
 
         ## session with outstanding analysis
         analysis_manager = AnalysisManager(config)
@@ -874,22 +909,23 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
 
         for session in sessions:
             table.add_row(
-                session['id'], session['title'], ', '.join(session['missing_observers']) )
+                session["id"], session["title"], ", ".join(session["missing_observers"])
+            )
 
         console.print(table)
         return
-    
+
     # Require file patterns when not listing
     if not file_patterns:
         console.print("[red]Error: FILE_PATTERNS required when not using --list[/red]")
         return
-    
+
     # Resolve file patterns to get matched files
     matched_files = resolve_file_patterns(file_patterns)
     if not matched_files:
         console.print("[yellow]No files matched the provided patterns[/yellow]")
         return
-    
+
     # Display files that will be processed
     table = Table(title="Files to Load")
     table.add_column("Index", style="cyan")
@@ -898,23 +934,29 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
     table.add_column("Description", style="green")
     table.add_column("Author", style="blue")
     table.add_column("Life Stage", style="yellow")
-    
+
     for idx, file_path in enumerate(matched_files, 1):
         # Generate name if template provided
         item_name = (
-            name.format(index=idx) if name and "{index}" in name
+            name.format(index=idx)
+            if name and "{index}" in name
             else name or os.path.splitext(os.path.basename(file_path))[0]
         )
 
         table.add_row(
-            str(idx), item_name, os.path.basename(file_path), description, author_name, lifestage
+            str(idx),
+            item_name,
+            os.path.basename(file_path),
+            description,
+            author_name,
+            lifestage,
         )
-    
+
     console.print(table)
-    
+
     if dryrun:
         return
-    
+
     # Process the files
     result = loader.batch_load(
         file_patterns=file_patterns,
@@ -922,22 +964,115 @@ def load(ctx, db_path: Optional[str], file_patterns: tuple, name: Optional[str],
         author=author,
         description=description,
         lifestage=lifestage,
-        priority=priority
+        priority=priority,
     )
-    
-    console.print(f"[green]Successfully loaded {len(result['loaded_files'])} of {len(matched_files)} files[/green]")
-    
+
+    console.print(
+        f"[green]Successfully loaded {len(result['loaded_files'])} of {len(matched_files)} files[/green]"
+    )
+
     # Show loaded file details
-    if result['loaded_files']:
+    if result["loaded_files"]:
         details_table = Table(title="Loaded Files")
         details_table.add_column("Name", style="green")
         details_table.add_column("Source ID", style="cyan")
-        
-        for i, source_id in enumerate(result['source_ids']):
-            file_name = os.path.basename(result['loaded_files'][i])
+
+        for i, source_id in enumerate(result["source_ids"]):
+            file_name = os.path.basename(result["loaded_files"][i])
             details_table.add_row(file_name, source_id)
-            
+
         console.print(details_table)
+
+
+@cli.command()
+@click.argument("db_path", type=click.Path(exists=True), required=False)
+@click.option("--output", "-o", type=click.Path(), help="Output file path")
+@click.option(
+    "--format",
+    "-f",
+    type=click.Choice(["md", "json", "raw"], case_sensitive=False),
+    default="md",
+    help="Output format (raw = unsynthesized data)",
+)
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["short", "long"], case_sensitive=False),
+    default="short",
+    help="Length of profile (ignored for raw format)",
+)
+@click.pass_context
+def profile(
+    ctx,
+    db_path: Optional[str],
+    output: Optional[str],
+    format: str,
+    mode: str,
+):
+    """
+    Generate a profile from the knowledge base.
+
+    Creates a formatted profile document based on consensus records and notes.
+
+    Formats:
+      - md: Markdown format with narrative synthesis
+      - json: JSON structured format with narrative synthesis
+      - raw: Raw knowledge records without narrative synthesis
+
+    Modes (for md and json formats only):
+      - short: Concise synthesized profile
+      - long: Detailed synthesized profile
+    """
+    config = ctx.obj
+
+    # Apply overrides if provided
+    if db_path:
+        config.database.path = db_path
+        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
+
+    if not db_path and not config.database.path:
+        console.print(
+            f"[red]Error: No database path provided and not found in configuration[/red]"
+        )
+        return
+
+    if format == "raw":
+        console.print("[blue]Generating raw knowledge records...[/blue]")
+    else:
+        console.print(f"[blue]Generating {mode} profile in {format} format...[/blue]")
+
+    # Call the profile generator
+    from core.profile import ProfileGenerator
+
+    profile_generator = ProfileGenerator(config)
+
+    try:
+        with Progress() as progress:
+            task = progress.add_task("[cyan]Generating profile...", total=1)
+
+            # Generate the profile
+            profile_content = profile_generator.generate_profile(format, mode)
+
+            progress.update(task, advance=1)
+
+        # Output the profile
+        if output:
+            with open(output, "w") as f:
+                f.write(profile_content)
+            console.print(f"[green]Profile written to {output}[/green]")
+        else:
+            if format == "raw":
+                console.print("\n[bold]Raw Knowledge Records:[/bold]\n")
+            else:
+                console.print("\n[bold]Profile:[/bold]\n")
+
+            # For long output, it's better to show it in a scrollable panel
+            console.print(Panel(profile_content))
+
+    except Exception as e:
+        console.print(f"[red]Error generating profile: {str(e)}[/red]")
+        logger.exception("Error generating profile")
+
 
 if __name__ == "__main__":
     cli()

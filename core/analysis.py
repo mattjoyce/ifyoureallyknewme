@@ -445,6 +445,7 @@ class AnalysisManager:
             
             # Read and add content from file path
             file_path = session['file_path']
+            logger.info(f"Reading content from file: {file_path}")
             if file_path and Path(file_path).exists():
                 try:
                     source_content = read_file_with_fallback_encodings(file_path)
