@@ -5,10 +5,10 @@ import logging
 from pathlib import Path
 from mcp.server.fastmcp import FastMCP, Context
 
-# Set up logging
+# Set up logging to both console and file
 log_file_path = "question_server.log"
 logging.basicConfig(
-    level=logging.INFO, 
+    level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.FileHandler(log_file_path),
@@ -16,6 +16,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+logger.info(f"Logging to file: {log_file_path}")
 
 # Initialize FastMCP server
 mcp = FastMCP("Question Server")
@@ -98,9 +99,50 @@ def get_all_questions() -> str:
     """Get all questions as a formatted list."""
     return "\n\n".join([f"{i+1}. {q}" for i, q in enumerate(QUESTIONS)])
 
-# Prompts
+# New tool to replace the prompt
+@mcp.tool()
+def conduct_interview() -> dict:
+    """
+    Get interview configuration with a random question.
+    
+    Returns a dictionary with the interviewer configuration and a random question.
+    """
+    logger.info("Tool Requested: conduct_interview")
+    question = get_random_question()
+    
+    try:
+        with open("Role-Interviewer-mcp.md") as f:
+            interviewer_role = f.read()
+        
+        # Replace placeholder with the actual question
+        interviewer_role = interviewer_role.replace("{{question}}", question)
+        
+        # Return a dictionary with the interviewer configuration
+        return {
+            "interviewer_role": interviewer_role,
+            "question": question,
+            "emojis": {
+                "interviewer": "👨‍💼📋",
+                "initial_question": "🤔",
+                "follow_up": "🔍"
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error loading interviewer role: {e}")
+        # Fallback if role file isn't available
+        return {
+            "interviewer_role": "You are an interviewer.",
+            "question": question,
+            "emojis": {
+                "interviewer": "👨‍💼📋",
+                "initial_question": "🤔",
+                "follow_up": "🔍"
+            }
+        }
+
+# Keep the prompt as well for backward compatibility, but it might still have issues
 @mcp.prompt(name="ConductInterview", description="Conduct an interview.")
-def conduct_interview() -> list:
+def conduct_interview_prompt() -> list:
     """
     Conduct an interview using a random question.
     """
@@ -143,7 +185,6 @@ def conduct_interview() -> list:
                 }
             }
         ]
-
 
 # Run the server
 if __name__ == "__main__":
