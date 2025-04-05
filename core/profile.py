@@ -49,6 +49,37 @@ class ProfileGenerator:
         self.config = config
         self.db_path = config.database.path
 
+    def dump_observations(self) -> str:
+        """
+        Dump all observations from the database.
+        
+        Returns:
+            String of observations
+        """
+        conn, cursor = get_connection(self.db_path)
+        query="SELECT content, created_at FROM knowledge_records WHERE consensus_id IS NULL ORDER BY created_at"
+        cursor.execute(query)
+        results = cursor.fetchall()
+        records = []
+        for row in results:
+            try:
+                content = json.loads(row[0])
+                record = {
+                    'observation': content.get('observation', ''),
+                    'domain': content.get('domain', ''),
+                    'confidence': content.get('confidence', ''),
+                }
+                records.append(record)
+            except json.JSONDecodeError:
+                print(f"Error decoding JSON: {row[1]}")
+        conn.close()
+        output = ""    
+        for record in records:
+            output+=f"{record['domain']}: {record['observation']}"
+        return output
+
+
+
     def get_consensus_records(self) -> List[Dict[str, Any]]:
         """
         Retrieve all consensus records from the database.
