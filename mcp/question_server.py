@@ -100,7 +100,7 @@ def conduct_interview() -> list:
     question = get_random_question()
     
     try:
-        with open("../roles/Role-Interviewer-mcp.md") as f:
+        with open("Role-Interviewer-mcp.md") as f:
             system_prompt = f.read()
         
         # Replace placeholder with the actual question
