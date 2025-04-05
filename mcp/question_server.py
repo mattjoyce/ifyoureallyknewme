@@ -6,7 +6,15 @@ from pathlib import Path
 from mcp.server.fastmcp import FastMCP, Context
 
 # Set up logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+log_file_path = "question_server.log"
+logging.basicConfig(
+    level=logging.INFO, 
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=[
+        logging.FileHandler(log_file_path),
+        logging.StreamHandler()  # Keep console output as well
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Initialize FastMCP server
