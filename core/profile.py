@@ -75,7 +75,7 @@ class ProfileGenerator:
         conn.close()
         output = ""    
         for record in records:
-            output+=f"{record['domain']}: {record['observation']}"
+            output+=f"{record['observation']}\n"
         return output
 
 

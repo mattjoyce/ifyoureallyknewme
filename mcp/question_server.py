@@ -46,12 +46,54 @@ class Question:
 class Timer:
     name: str
     start_time: datetime
+    target_duration: Optional[timedelta] = None
 
     def elapsed(self) -> timedelta:
         return datetime.now() - self.start_time
-
+        
+    def remaining(self) -> Optional[timedelta]:
+        if self.target_duration is None:
+            return None
+        return self.target_duration - self.elapsed()
+    
+    def progress_percentage(self) -> Optional[float]:
+        if self.target_duration is None:
+            return None
+        elapsed_seconds = self.elapsed().total_seconds()
+        target_seconds = self.target_duration.total_seconds()
+        return min(100, (elapsed_seconds / target_seconds) * 100)
+    
+    def progress_description(self) -> str:
+        if self.target_duration is None:
+            return f"Running for {self.pretty_elapsed()}"
+        
+        percentage = self.progress_percentage()
+        if percentage <= 10:
+            return "Just getting started"
+        elif percentage <= 30:
+            return "In the early stages"
+        elif percentage <= 50:
+            return "About halfway through"
+        elif percentage <= 75:
+            return "Well past halfway"
+        elif percentage <= 90:
+            return "Nearing the end"
+        else:
+            return "Time to wrap up"
+    
     def pretty_elapsed(self) -> str:
         delta = self.elapsed()
+        minutes, seconds = divmod(delta.total_seconds(), 60)
+        return f"{int(minutes)}m {int(seconds)}s"
+    
+    def pretty_remaining(self) -> Optional[str]:
+        if self.target_duration is None:
+            return None
+        
+        delta = self.remaining()
+        if delta.total_seconds() < 0:
+            return "Time is up"
+        
         minutes, seconds = divmod(delta.total_seconds(), 60)
         return f"{int(minutes)}m {int(seconds)}s"
 
@@ -60,21 +102,44 @@ class TimerManager:
     def __init__(self):
         self.timers: dict[str, Timer] = {}
 
-    def start(self, name: str = "default") -> str:
-        self.timers[name] = Timer(name=name, start_time=datetime.now())
-        return f"Timer '{name}' started."
+    def start(self, name: str = "default", minutes: int = 0) -> str:
+        target_duration = timedelta(minutes=minutes) if minutes > 0 else None
+        self.timers[name] = Timer(
+            name=name, 
+            start_time=datetime.now(), 
+            target_duration=target_duration
+        )
+        
+        if target_duration:
+            return f"Timer '{name}' started with target duration of {minutes} minutes."
+        else:
+            return f"Timer '{name}' started without a target duration."
 
     def check(self, name: str = "default") -> str:
         timer = self.timers.get(name)
         if not timer:
             return f"❌ No timer named '{name}' found."
-        return f"Timer '{name}' has been running for {timer.pretty_elapsed()}."
+            
+        progress = timer.progress_description()
+        elapsed = timer.pretty_elapsed()
+        
+        if timer.target_duration:
+            remaining = timer.pretty_remaining()
+            percentage = int(timer.progress_percentage())
+            return f"Timer '{name}': {progress} ({elapsed} elapsed, {remaining} remaining, {percentage}% complete)"
+        else:
+            return f"Timer '{name}' has been running for {elapsed}."
 
     def stop(self, name: str = "default") -> str:
         timer = self.timers.pop(name, None)
         if not timer:
             return f"❌ No timer named '{name}' to stop."
-        return f"Timer '{name}' stopped after {timer.pretty_elapsed()}."
+            
+        if timer.target_duration:
+            percentage = int(timer.progress_percentage())
+            return f"Timer '{name}' stopped after {timer.pretty_elapsed()} ({percentage}% of target duration)"
+        else:
+            return f"Timer '{name}' stopped after {timer.pretty_elapsed()}."
 
 
 # Instantiate the timer manager
@@ -175,17 +240,45 @@ def get_coverage_report() -> str:
     return coverage_report
 
 @mcp.tool()
-def start_timer(name: str = "default") -> str:
-    return timer_manager.start(name)
+def start_timer(name: str = "default", minutes: int = 0) -> str:
+    """
+    Start a timer with an optional target duration.
+    
+    Args:
+        name: Name of the timer (default: "default")
+        minutes: Target duration in minutes (default: 0, meaning no target)
+    
+    Returns:
+        Status message
+    """
+    return timer_manager.start(name, minutes)
 
 
 @mcp.tool()
 def check_timer(name: str = "default") -> str:
+    """
+    Check the current status of a timer.
+    
+    Args:
+        name: Name of the timer to check (default: "default")
+    
+    Returns:
+        Status message with elapsed time and, if applicable, remaining time and progress
+    """
     return timer_manager.check(name)
 
 
 @mcp.tool()
 def stop_timer(name: str = "default") -> str:
+    """
+    Stop a timer and get the final elapsed time.
+    
+    Args:
+        name: Name of the timer to stop (default: "default")
+    
+    Returns:
+        Final timer status
+    """
     return timer_manager.stop(name)
 
 
@@ -248,6 +341,7 @@ def conduct_interview() -> dict:
         "check action": "check timer each follow-up question",
         "stop action": "stop timer when interview is complete",
         "persona and instructions": interviewer_role,
+        "final action": "return the interview transcript as markdown file, and use the the question ID in the title.",
     }
 
 # Run the server
