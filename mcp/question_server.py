@@ -193,7 +193,7 @@ QUESTIONS = load_questions(QUESTION_CSV_FILE)
 
 
 
-def get_question_by_domain(domain: Optional[str], questions: List[Question]) -> Optional[str]:
+def get_question_by_domain(domain: Optional[str], questions: List[Question]) -> Question:
     """Get a random question from the specified domain.
     
     Args:
@@ -214,7 +214,7 @@ def get_question_by_domain(domain: Optional[str], questions: List[Question]) -> 
         return None
     
     # Select a random question
-    return random.choice(domain_questions).text
+    return random.choice(domain_questions)
 
 
 def get_available_domains(questions: List[Question]) -> List[str]:
@@ -283,15 +283,15 @@ def stop_timer(name: str = "default") -> str:
 
 
 @mcp.tool()
-def get_random_question(domain: Optional[str] = None) -> str:
+def get_random_question(domain: Optional[str] = None) -> Question:
     """Get a random question for a specific domain, or pick from the Non-Domain questions."""
     if not QUESTIONS:
         return "No questions available."
     
-    question_text = get_question_by_domain(domain, QUESTIONS)
-    if question_text:
-        logger.info(f"Returning domain-specific question: {question_text[:30]}...")
-        return question_text
+    question = get_question_by_domain(domain, QUESTIONS)
+    if question.text:
+        logger.info(f"Returning domain-specific question: {question.QID} {question.text[:30]}...")
+        return Question
     else:
         return f"No questions found for domain: {domain}"
 
