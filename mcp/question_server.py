@@ -291,7 +291,7 @@ def get_random_question(domain: Optional[str] = None) -> Question:
     question = get_question_by_domain(domain, QUESTIONS)
     if question.text:
         logger.info(f"Returning domain-specific question: {question.QID} {question.text[:30]}...")
-        return Question
+        return question
     else:
         return f"No questions found for domain: {domain}"
 
