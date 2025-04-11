@@ -25,7 +25,7 @@ from core.config import ConfigSchema, get_config
 from core.query import Query
 
 # Load configuration
-config = get_config(Path("../../test_config.yaml").resolve().absolute())
+config = get_config(Path(PROJECT_ROOT,"test_config.yaml").resolve().absolute())
 # Initialize query instance
 query_manager = Query(config)
 
