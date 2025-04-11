@@ -14,6 +14,13 @@ import io
 import csv
 import random
 
+BASE_DIR = Path(__file__).parent.resolve()
+QUESTION_CSV_FILE = Path(BASE_DIR, "domain-questions.csv").resolve()
+COVERAGE_REPORT_FILE = Path(BASE_DIR, "coverage_report.md").resolve()
+PROJECT_ROOT = Path(__file__).parent.parent.parent  # Go up 3 levels from core/mcp/question_server.py
+sys.path.append(str(PROJECT_ROOT))
+
+
 from core.config import ConfigSchema, get_config
 from core.query import Query
 
@@ -24,9 +31,6 @@ query_manager = Query(config)
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
-BASE_DIR = Path(__file__).parent.resolve()
-QUESTION_CSV_FILE = Path(BASE_DIR, "domain-questions.csv").resolve()
-COVERAGE_REPORT_FILE = Path(BASE_DIR, "coverage_report.md").resolve()
 
 # Set up logging to both console and file
 log_file_path = Path(BASE_DIR, "question_server.log").resolve()
