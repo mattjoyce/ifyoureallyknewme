@@ -14,6 +14,14 @@ import io
 import csv
 import random
 
+from core.config import ConfigSchema, get_config
+from core.query import Query
+
+# Load configuration
+config = get_config(Path("../test_config.yaml").resolve().absolute())
+# Initialize query instance
+query_manager = Query(config)
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8")
 BASE_DIR = Path(__file__).parent.resolve()
@@ -343,6 +351,28 @@ def conduct_interview() -> dict:
         "persona and instructions": interviewer_role,
         "final action": "return the interview transcript as markdown file, and use the the question ID in the title.",
     }
+
+
+@mcp.tool()
+def search_by_topic(topic: str, threshold: float = 0.85, domain: List[str] = None, 
+                    lifestage: List[str] = None, confidence: List[str] = None) -> List[dict]:
+    """Search knowledge base for observations related to a topic."""
+    results = query_manager.get_observations_by_similarity(
+        topic, threshold, domain, lifestage, confidence
+    )
+    # Convert to suitable format for MCP
+    return [record.dict() for record in results]
+
+@mcp.tool()
+def get_knowledge_records(session_id: str = None, domain: List[str] = None, 
+                         lifestage: List[str] = None, type: str = None) -> List[dict]:
+    """Retrieve knowledge records with filters."""
+    records = query_manager.get_kr(
+        session_id=session_id, domain=domain, lifestage=lifestage, type=type
+    )
+    return [record.dict() for record in records]
+
+
 
 # Run the server
 if __name__ == "__main__":
