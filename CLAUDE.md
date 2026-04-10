@@ -26,7 +26,10 @@
 - Configuration via `config.yaml` (loaded by loaden with .env support)
 - Database schema in `schema.sql`
 - Role definitions in `roles/` directory
-- Private data in `private/` (gitignored)
+- Reference material in `reference/` (question banks, prompts, docs)
+- Generated output in `results/` (profiles, coverage reports — gitignored)
+- Private data in `private/` (transcripts, source DBs — gitignored)
+- Deprecated code in `archive/` (old modules, MCP, configs — gitignored)
 
 ## Configuration
 - Default config file: `config.yaml`

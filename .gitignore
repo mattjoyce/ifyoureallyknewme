@@ -173,18 +173,14 @@ cython_debug/
 # Private data
 private/
 
-# Deprecated files (kept locally, not tracked)
-core/
-knowme_mcp.py
-knowme_mcp_server.py
-process_consensus.py
-find_note_clusters.py
-get_profile2.py
-tst.py
-query_test.py
-myconfig.yaml
-example.config.yaml
-requirements.txt
+# Archive (deprecated code, old configs, logs, old DBs)
+archive/
+
+# Results (generated output — profiles, coverage reports)
+results/
+
+# Logs
+*.log
 
 # PyPI configuration file
 .pypirc
