@@ -59,10 +59,11 @@ Domain: [Name] (Weight: X%)
 ```
 
 2. Priority Recommendations
-Top 1 domain requiring attention, each including:
-- Domain name and weight
-- Current depth vs target depth
-- Specific aspects to explore
-- Rationale for prioritization
+Top two domain requiring attention, each including:
+- MUST : Domain name
+- SHOULD : Weight
+- SHOULD : Current depth vs target depth
+- MUST : Specific aspects to explore
+- SHOULD : Rationale for prioritization
 
 

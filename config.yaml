@@ -7,8 +7,8 @@ database:
 
 # LLM configuration
 llm:
-  generative_model: o3-mini
-  embedding_model: text-embedding-ada-002
+  generative_model: gpt-5.4
+  embedding_model: text-embedding-3-small
 
 # Role configuration
 roles:
