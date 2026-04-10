@@ -1,1083 +1,1975 @@
 #!/usr/bin/env python3
-"""
-KnowMe - A personal knowledge database CLI.
+"""KnowMe -- Personal knowledge management and analysis system.
 
-This is the main entry point for interacting with the TheInterview/KnowMe
-personal knowledge database. It provides commands for creating, consuming,
-analyzing and extracting insights from personal data.
+Single-file CLI for ingesting personal content, running LLM-based expert
+analysis, clustering observations into consensus records, and generating
+biographical profiles.
+
+Data flow:
+  Files -> Load (sources + queue) -> Analyze (sessions + LLM observers)
+  -> Knowledge Records -> Merge / Consensus -> Profile
 """
 
-import logging
+from __future__ import annotations
+
+import base64
+import contextlib
+import glob as glob_module
+import hashlib
 import json
+import logging
 import os
-from datetime import datetime
+import re
+import sqlite3
+from collections import defaultdict
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any
 
 import click
-from dotenv import load_dotenv
+import llm as llm_lib
+import loaden
+import numpy as np
+from openai import OpenAI
 from rich.console import Console
+from rich.logging import RichHandler
 from rich.panel import Panel
 from rich.progress import Progress
 from rich.table import Table
+from scipy.cluster.hierarchy import fcluster, linkage
 
-from core.analysis import AnalysisManager
-from core.consensus import ConsensusManager
-from core.load import Loader
-from core.config import configure_logging, get_config
-from core.database import create_database, get_connection
-from core.ingest import process_content
-from core.utils import generate_id, resolve_file_patterns
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
 
-
-# Initialize Rich console
 console = Console()
-
-# Set up basic logging - this will be properly configured once config is loaded
-logging.basicConfig(level=logging.INFO, format="%(message)s", handlers=[])
 logger = logging.getLogger(__name__)
+
+LIFE_STAGES: list[str] = [
+    "CHILDHOOD",
+    "ADOLESCENCE",
+    "EARLY_ADULTHOOD",
+    "EARLY_CAREER",
+    "MID_CAREER",
+    "LATE_CAREER",
+]
+
+DOMAINS: list[str] = [
+    "Personal History",
+    "Professional Evolution",
+    "Psychological and Behavioral Evolution",
+    "Relationships and Networks",
+    "Community and Ideological Engagement",
+    "Daily Routines and Health",
+    "Values, Beliefs, and Goals",
+    "Active Projects and Learning",
+]
+
+# ---------------------------------------------------------------------------
+# Configuration  (loaden)
+# ---------------------------------------------------------------------------
+
+_cached_config_path: str | None = None
+
+
+def get_config(config_path: str | None = None) -> dict[str, Any]:
+    """Load and return configuration via loaden.
+
+    Searches for a config file in this order:
+    1. Explicit *config_path* argument
+    2. Previously cached path
+    3. ``KNOWME_CONFIG_PATH`` environment variable
+    """
+    global _cached_config_path
+    config_path = config_path or _cached_config_path
+
+    if config_path is None:
+        config_path = os.getenv("KNOWME_CONFIG_PATH")
+
+    if config_path is None:
+        raise FileNotFoundError(
+            "No config path provided. Pass --config or set KNOWME_CONFIG_PATH."
+        )
+
+    resolved = Path(config_path).resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Configuration file not found: {resolved}")
+
+    _cached_config_path = str(resolved)
+    cfg = loaden.load_config(str(resolved))
+    # Ensure runtime-only keys exist
+    cfg.setdefault("dryrun", False)
+    return cfg
+
+
+def configure_logging(level: str | None = None, log_file: str | None = None) -> None:
+    """Configure root logger with Rich console + optional file handler."""
+    level = level or "WARNING"
+    log_file = log_file or "knowme.log"
+
+    root = logging.getLogger()
+    for handler in root.handlers[:]:
+        root.removeHandler(handler)
+
+    root.setLevel(getattr(logging, level.upper()))
+
+    console_handler = RichHandler(rich_tracebacks=True, markup=True)
+    root.addHandler(console_handler)
+
+    if log_file != "-":
+        log_dir = Path(log_file).parent
+        if log_dir != Path(".") and not log_dir.exists():
+            log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+        )
+        root.addHandler(file_handler)
+
+
+# ---------------------------------------------------------------------------
+# Database helpers
+# ---------------------------------------------------------------------------
+
+
+def get_connection(db_path: str) -> tuple[sqlite3.Connection, sqlite3.Cursor]:
+    """Return a (connection, cursor) pair with Row factory enabled."""
+    if not db_path:
+        raise ValueError("No database path provided.")
+    if not Path(db_path).exists():
+        raise FileNotFoundError(f"Database file not found: {db_path}")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn, conn.cursor()
+
+
+@contextmanager
+def db_cursor(db_path: str, *, commit: bool = False):
+    """Context manager for DB access.  Commits if *commit* is True, always closes."""
+    conn, cursor = get_connection(db_path)
+    try:
+        yield conn, cursor
+        if commit:
+            conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def create_database(config: dict[str, Any]) -> bool:
+    """Create a new database from schema.sql."""
+    try:
+        schema_path = Path(loaden.get(config, "database.schema_path"))
+        if not schema_path.exists():
+            raise FileNotFoundError(f"Schema file not found at {schema_path}")
+
+        db_path = loaden.get(config, "database.path")
+        if not db_path:
+            raise ValueError("No database path in configuration.")
+
+        conn = sqlite3.connect(db_path)
+        conn.executescript(schema_path.read_text(encoding="utf-8"))
+        conn.commit()
+        conn.close()
+        logger.info("Created database at %s", db_path)
+        return True
+    except (sqlite3.Error, FileNotFoundError) as exc:
+        logger.error("Error creating database: %s", exc)
+        return False
+
+
+def store_knowledge_record(
+    config: dict[str, Any],
+    note_id: str,
+    record_type: str,
+    author: str,
+    content: dict[str, Any],
+    ts: str,
+    embedding_bytes: bytes,
+    session_id: str | None = None,
+    qa_id: str | None = None,
+    source_id: str | None = None,
+    keywords: list[str] | None = None,
+) -> None:
+    """Insert a single knowledge record into the database."""
+    db_path = loaden.get(config, "database.path")
+    conn, cursor = get_connection(db_path)
+    cursor.execute(
+        """
+        INSERT INTO knowledge_records
+        (id, type, author, content, created_at,
+         embedding, session_id, qa_id, source_id, keywords)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            note_id,
+            record_type,
+            author,
+            json.dumps(content),
+            ts,
+            embedding_bytes,
+            session_id,
+            qa_id,
+            source_id,
+            ",".join(keywords) if keywords else None,
+        ),
+    )
+    conn.commit()
+    conn.close()
+    logger.info("Stored knowledge record: %s", note_id)
+
+
+@dataclass
+class KnowledgeRecord:
+    """Lightweight data-transfer object for knowledge records."""
+
+    id: str
+    type: str
+    domain: str | None = None
+    author: str | None = None
+    content: dict[str, Any] = field(default_factory=dict)
+    created_at: str | None = None
+    version: str | None = None
+    consensus_id: str | None = None
+    session_id: str | None = None
+    qa_id: str | None = None
+    source_id: str | None = None
+    keywords: str | None = None
+    embedding: str | None = None  # base64
+
+
+def get_filtered_knowledge_records(
+    config: dict[str, Any],
+    session_id: str | None = None,
+    domain: list[str] | None = None,
+    confidence: list[str] | None = None,
+    lifestage: list[str] | None = None,
+    observation_text: list[str] | None = None,
+    record_type: str | None = None,
+    author: str | None = None,
+    consensus_id: str | None = None,
+    qa_id: str | None = None,
+    source_id: str | None = None,
+    include_embedding: bool = False,
+) -> list[KnowledgeRecord]:
+    """Query knowledge_records with optional filters."""
+    db_path = loaden.get(config, "database.path")
+    conn, cursor = get_connection(db_path)
+
+    cols = (
+        "id, type, domain, author, content, created_at, version, "
+        "consensus_id, session_id, qa_id, source_id, keywords"
+    )
+    if include_embedding:
+        cols += ", embedding"
+
+    query = f"SELECT {cols} FROM knowledge_records WHERE 1=1"
+    params: list[Any] = []
+
+    for col, val in [
+        ("session_id", session_id),
+        ("type", record_type),
+        ("author", author),
+        ("consensus_id", consensus_id),
+        ("qa_id", qa_id),
+        ("source_id", source_id),
+    ]:
+        if val is not None:
+            query += f" AND {col} = ?"
+            params.append(val)
+
+    cursor.execute(query, params)
+    records: list[KnowledgeRecord] = []
+
+    for row in cursor.fetchall():
+        try:
+            content = json.loads(row[4])
+        except json.JSONDecodeError:
+            logger.warning("Bad JSON in record %s", row[0])
+            continue
+
+        emb_b64: str | None = None
+        if include_embedding and row[12] is not None:
+            emb_b64 = base64.b64encode(row[12]).decode("utf-8")
+
+        rec = KnowledgeRecord(
+            id=row[0],
+            type=row[1],
+            domain=row[2],
+            author=row[3],
+            content=content,
+            created_at=row[5],
+            version=row[6],
+            consensus_id=row[7],
+            session_id=row[8],
+            qa_id=row[9],
+            source_id=row[10],
+            keywords=row[11],
+            embedding=emb_b64,
+        )
+
+        # Client-side filters on JSON content
+        if domain and not any(
+            d.lower() in rec.content.get("domain", "").lower() for d in domain
+        ):
+            continue
+        if confidence and not any(
+            c.lower() in rec.content.get("confidence", "").lower() for c in confidence
+        ):
+            continue
+        if lifestage and not any(
+            ls.lower() in rec.content.get("life_stage", "").lower() for ls in lifestage
+        ):
+            continue
+        if observation_text and not any(
+            ot.lower() in rec.content.get("observation", "").lower() for ot in observation_text
+        ):
+            continue
+
+        records.append(rec)
+
+    conn.close()
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Embeddings
+# ---------------------------------------------------------------------------
+
+
+_openai_client: OpenAI | None = None
+
+
+def _get_openai_client() -> OpenAI:
+    """Lazy singleton for OpenAI client."""
+    global _openai_client
+    if _openai_client is None:
+        _openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    return _openai_client
+
+
+def get_embedding(config: dict[str, Any], text: str, model: str | None = None) -> np.ndarray:
+    """Get an embedding vector from OpenAI."""
+    model = model or loaden.get(config, "llm.embedding_model")
+    client = _get_openai_client()
+    response = client.embeddings.create(model=model, input=text)
+    return np.array(response.data[0].embedding, dtype=np.float32)
+
+
+def cosine_similarity(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Cosine similarity between two vectors."""
+    v1, v2 = v1.flatten(), v2.flatten()
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 == 0 or n2 == 0:
+        return 0.0
+    return float(np.dot(v1, v2) / (n1 * n2))
+
+
+def cosine_similarity_base64(a: str, b: str, dtype: type = np.float32) -> float:
+    """Cosine similarity between two base64-encoded vectors."""
+    try:
+        return cosine_similarity(
+            np.frombuffer(base64.b64decode(a), dtype=dtype),
+            np.frombuffer(base64.b64decode(b), dtype=dtype),
+        )
+    except (ValueError, TypeError):
+        return 0.0
+
+
+def compute_pairwise_similarities(
+    embeddings: list[np.ndarray],
+) -> np.ndarray:
+    """Pairwise cosine similarity matrix."""
+    if not embeddings:
+        return np.array([])
+    stacked = np.vstack(embeddings)
+    norms = np.linalg.norm(stacked, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    normed = stacked / norms
+    return np.dot(normed, normed.T)
+
+
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+
+def call_llm(
+    input_content: str | dict[str, Any] | list[Any],
+    prompt: str,
+    model_name: str,
+    json_output: bool = True,
+) -> Any:
+    """Call an LLM via Simon Willison's ``llm`` library."""
+    if isinstance(input_content, (dict, list)):
+        input_str = json.dumps(input_content)
+    else:
+        input_str = str(input_content)
+
+    model = llm_lib.get_model(model_name or "gpt-4o-mini")
+    response = model.prompt(prompt=f"{prompt}\n\n{input_str}")
+
+    response_dict = response.json()
+    content_str: str = response_dict["content"]
+
+    if json_output:
+        try:
+            return json.loads(content_str)
+        except json.JSONDecodeError:
+            return extract_json(content_str)
+    return content_str
+
+
+def extract_json(text: str) -> Any:
+    """Extract JSON from potentially markdown-wrapped or messy text.
+
+    Tries ``json.loads`` first, then falls back to regex extraction.
+    """
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        pass
+    for pattern in (r"\{[\s\S]*\}", r"\[[\s\S]*\]"):
+        for match in re.finditer(pattern, text):
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                continue
+    raise ValueError("No valid JSON found in text")
+
+
+def llm_process(
+    config: dict[str, Any],
+    input_content: str | dict[str, Any] | list[Any],
+    prompt: str,
+    model: str | None = None,
+    expect_json: bool = True,
+) -> Any:
+    """High-level: call LLM, return parsed result."""
+    model = model or loaden.get(config, "llm.generative_model")
+    return call_llm(input_content, prompt, model, json_output=expect_json)
+
+
+def get_role_file(config: dict[str, Any], role_name: str, role_type: str) -> Path:
+    """Resolve a role markdown file path."""
+    if role_type not in ("Helper", "Observer"):
+        raise ValueError(f"Invalid role type: {role_type}")
+
+    key = "roles.Observers" if role_type == "Observer" else "roles.Helpers"
+    roles: list[dict[str, str]] = loaden.get(config, key, [])
+    target = next((r for r in roles if r["name"] == role_name), None)
+    if target is None:
+        raise ValueError(f"Role '{role_name}' not found in {role_type}s")
+
+    roles_dir = loaden.get(config, "roles.path", "./roles")
+    role_path = Path(roles_dir) / target["file"]
+    resolved = role_path.resolve()
+    if not resolved.exists():
+        raise FileNotFoundError(f"Role file not found: {resolved}")
+    return resolved
+
+
+def get_role_prompt(config: dict[str, Any], role_name: str, role_type: str) -> str:
+    """Load a role prompt, injecting the schema for Observers."""
+    role_file = get_role_file(config, role_name, role_type)
+    prompt = role_file.read_text(encoding="utf-8")
+
+    if role_type == "Observer":
+        roles_dir = loaden.get(config, "roles.path", "./roles")
+        schema_file = loaden.get(config, "roles.schema_file", "")
+        if schema_file:
+            schema_path = (Path(roles_dir) / schema_file).resolve()
+            if schema_path.exists():
+                schema_text = schema_path.read_text(encoding="utf-8")
+                prompt = prompt.replace("{{schema}}", schema_text)
+    return prompt
+
+
+def extract_keywords(config: dict[str, Any], content: str) -> list[str]:
+    """Extract keywords from text using the KeywordExtractor role."""
+    if not isinstance(content, str) or not content:
+        return []
+
+    model = loaden.get(config, "llm.generative_model")
+    prompt = get_role_prompt(config, "KeywordExtractor", "Helper")
+
+    try:
+        result = llm_process(
+            config,
+            input_content=content,
+            prompt=prompt,
+            model=model,
+            expect_json=True,
+        )
+        kw_raw: Any = None
+        if isinstance(result, dict):
+            kw_raw = result.get("keywords", "")
+        else:
+            parsed = extract_json(str(result))
+            kw_raw = parsed.get("keywords", "") if isinstance(parsed, dict) else ""
+
+        if isinstance(kw_raw, str):
+            return [k.strip() for k in kw_raw.split(",") if k.strip()]
+        return []
+    except Exception:
+        logger.exception("Keyword extraction failed")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Utility functions
+# ---------------------------------------------------------------------------
+
+
+def utcnow_iso() -> str:
+    """ISO-8601 UTC timestamp."""
+    return datetime.now(UTC).isoformat()
+
+
+def generate_id(prefix: str, *args: object) -> str:
+    """Deterministic hash-based ID with prefix."""
+    raw = "-".join(str(a) for a in args) + "-" + utcnow_iso()
+    return f"{prefix}_{hashlib.sha256(raw.encode()).hexdigest()[:12]}"
+
+
+def resolve_file_patterns(
+    patterns: tuple[str, ...] | list[str], recursive: bool = True
+) -> list[str]:
+    """Expand glob patterns into sorted, unique, absolute paths."""
+    matched: set[str] = set()
+    for pat in patterns:
+        abs_pat = pat if os.path.isabs(pat) else str(Path.cwd() / pat)
+        abs_pat = os.path.normpath(abs_pat)
+        matched.update(glob_module.glob(abs_pat, recursive=recursive))
+    return sorted(matched)
+
+
+def read_file_fallback(file_path: str | Path) -> str:
+    """Read text file trying multiple encodings."""
+    for enc in ("utf-8", "latin-1", "windows-1252", "cp1252", "ISO-8859-1"):
+        try:
+            return Path(file_path).read_text(encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    return Path(file_path).read_bytes().decode("utf-8", errors="replace")
+
+
+# ---------------------------------------------------------------------------
+# Ingest  (QA transcript processing)
+# ---------------------------------------------------------------------------
+
+
+def extract_qa_pairs(qa_content: str) -> list[tuple[str, str]]:
+    """Extract (question, answer) tuples from ``Q. / A.`` formatted text."""
+    parts = re.split(r"(?:^|\n)Q\.\s*", qa_content, flags=re.MULTILINE)
+    pairs: list[tuple[str, str]] = []
+    for part in parts[1:]:
+        if "A." in part:
+            q, a = part.split("A.", 1)
+            pairs.append((q.strip(), a.strip()))
+        else:
+            pairs.append((part.strip(), ""))
+    return pairs
+
+
+def ingest_qa_content(
+    db_path: str,
+    content: str,
+    name: str,
+    author: str,
+    lifestage: str,
+    filename: str,
+) -> str | None:
+    """Process QA content into a session + qa_pairs rows."""
+    qa_pairs = extract_qa_pairs(content)
+    if not qa_pairs:
+        return None
+
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    ts = utcnow_iso()
+    session_id = generate_id("session", name)
+
+    try:
+        cursor.execute(
+            """INSERT INTO sessions
+               (id, title, description, file_path, created_at, metadata,
+                author, lifestage, content_type)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                name,
+                f"Processed from {filename}",
+                filename,
+                ts,
+                json.dumps({"source": "qa", "qa_count": len(qa_pairs)}),
+                author,
+                lifestage,
+                "qa",
+            ),
+        )
+        for idx, (question, answer) in enumerate(qa_pairs):
+            qa_id = generate_id("qa", session_id, idx)
+            cursor.execute(
+                """INSERT INTO qa_pairs
+                   (id, session_id, question, answer, sequence, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (qa_id, session_id, question, answer, idx + 1, ts),
+            )
+        conn.commit()
+        logger.info("Ingested %d QA pairs into session %s", len(qa_pairs), session_id)
+        return session_id
+    except Exception:
+        conn.rollback()
+        logger.exception("Error ingesting QA content")
+        return None
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Loader
+# ---------------------------------------------------------------------------
+
+
+class Loader:
+    """Load files into the sources table and enqueue for analysis."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.db_path: str = loaden.get(config, "database.path")
+
+    # -- single file --------------------------------------------------------
+
+    def load_file(
+        self,
+        file_path: str,
+        name: str,
+        author: str,
+        description: str,
+        lifestage: str,
+        priority: int = 0,
+    ) -> str | None:
+        """Load one file -> source record + queue entry.  Returns source_id."""
+        existing = self._check_duplicate_source(file_path, name, description)
+        if existing:
+            self._create_queue_entry(existing, author, lifestage, priority)
+            return existing
+
+        ts = utcnow_iso()
+        source_id = generate_id("source", name, ts)
+        conn, cursor = get_connection(self.db_path)
+        try:
+            cursor.execute(
+                """INSERT INTO sources (id, created_at, description, content_path, title)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (source_id, ts, description, str(Path(file_path).resolve()), name),
+            )
+            conn.commit()
+            self._create_queue_entry(source_id, author, lifestage, priority)
+            return source_id
+        except Exception:
+            conn.rollback()
+            logger.exception("Error loading %s", file_path)
+            return None
+        finally:
+            conn.close()
+
+    # -- batch --------------------------------------------------------------
+
+    def batch_load(
+        self,
+        file_patterns: tuple[str, ...] | list[str],
+        name_template: str | None = None,
+        author: str | None = None,
+        description: str | None = None,
+        lifestage: str = "AUTO",
+        priority: int = 0,
+    ) -> dict[str, Any]:
+        matched = resolve_file_patterns(file_patterns)
+        loaded: list[str] = []
+        source_ids: list[str] = []
+        for idx, fp in enumerate(matched, 1):
+            item_name = (
+                name_template.format(index=idx)
+                if name_template and "{index}" in name_template
+                else name_template or Path(fp).stem
+            )
+            sid = self.load_file(
+                fp,
+                item_name,
+                author or "",
+                description or f"Content from {Path(fp).name}",
+                lifestage,
+                priority,
+            )
+            if sid:
+                loaded.append(fp)
+                source_ids.append(sid)
+        return {
+            "matched_files": matched,
+            "loaded_files": loaded,
+            "source_ids": source_ids,
+        }
+
+    # -- queue management ---------------------------------------------------
+
+    def get_queue_items(
+        self, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        conn, cursor = get_connection(self.db_path)
+        try:
+            query = """
+                SELECT aq.id, aq.author, aq.lifestage, aq.type,
+                       aq.created_at, aq.status, aq.priority,
+                       s.id AS source_id, s.description, s.content_path, s.title
+                FROM analysis_queue aq
+                JOIN sources s ON aq.source_id = s.id
+            """
+            params: list[Any] = []
+            if status:
+                query += " WHERE aq.status = ?"
+                params.append(status)
+            query += " ORDER BY aq.priority DESC, aq.created_at ASC"
+            if limit > 0:
+                query += f" LIMIT {limit}"
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
+        finally:
+            conn.close()
+
+    def get_source_and_queue_item(
+        self,
+        source_id: str | None = None,
+        queue_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not (source_id or queue_id) or (source_id and queue_id):
+            raise ValueError("Provide exactly one of source_id / queue_id.")
+        conn, cursor = get_connection(self.db_path)
+        col = "aq.source_id" if source_id else "aq.id"
+        param = source_id or queue_id
+        cursor.execute(
+            f"""SELECT aq.id, aq.author, aq.lifestage, aq.type,
+                       aq.created_at, aq.status, aq.priority,
+                       s.id AS source_id, s.description, s.content_path, s.title
+                FROM analysis_queue aq
+                JOIN sources s ON aq.source_id = s.id
+                WHERE {col} = ?""",
+            (param,),
+        )
+        row = cursor.fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    # -- private helpers ----------------------------------------------------
+
+    def _create_queue_entry(
+        self,
+        source_id: str,
+        author: str,
+        lifestage: str,
+        priority: int,
+        status: str = "pending",
+    ) -> str | None:
+        conn, cursor = get_connection(self.db_path)
+        try:
+            ts = utcnow_iso()
+            queue_id = generate_id("queue", source_id, ts)
+            cursor.execute(
+                """INSERT INTO analysis_queue
+                   (id, author, lifestage, type, priority, status, created_at, source_id)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (queue_id, author, lifestage, "document", priority, status, ts, source_id),
+            )
+            conn.commit()
+            return queue_id
+        except Exception:
+            conn.rollback()
+            logger.exception("Error creating queue entry")
+            return None
+        finally:
+            conn.close()
+
+    def _check_duplicate_source(
+        self, file_path: str, title: str, description: str
+    ) -> str | None:
+        norm_path = str(Path(file_path).resolve())
+        conn, cursor = get_connection(self.db_path)
+        try:
+            cursor.execute("SELECT id FROM sources WHERE content_path = ?", (norm_path,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            source_id: str = row[0]
+            cursor.execute(
+                "UPDATE sources SET title = ?, description = ? WHERE id = ?",
+                (title, description, source_id),
+            )
+            cursor.execute(
+                "UPDATE analysis_queue SET status = 'cancelled' "
+                "WHERE source_id = ? AND status = 'pending'",
+                (source_id,),
+            )
+            conn.commit()
+            return source_id
+        except Exception:
+            conn.rollback()
+            return None
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# AnalysisManager
+# ---------------------------------------------------------------------------
+
+
+class AnalysisManager:
+    """Run LLM expert analyses on sessions."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    @property
+    def _db(self) -> str:
+        return loaden.get(self.config, "database.path")
+
+    @property
+    def _model(self) -> str:
+        return loaden.get(self.config, "llm.generative_model")
+
+    # -- session creation ---------------------------------------------------
+
+    def create_session(self, item: dict[str, Any]) -> str | None:
+        """Create a session record from a queue item.  Skips if exists."""
+        conn, cursor = get_connection(self._db)
+        cursor.execute(
+            "SELECT id FROM sessions WHERE source_id = ?",
+            (item["source_id"],),
+        )
+        if cursor.fetchone():
+            conn.close()
+            return None
+
+        session_id = generate_id("session", item["source_id"], item["id"])
+        cursor.execute(
+            """INSERT INTO sessions
+               (id, title, description, author, lifestage, file_path,
+                content_type, source_id, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                session_id,
+                item["title"],
+                item.get("description", ""),
+                item["author"],
+                item["lifestage"],
+                item["content_path"],
+                "document",
+                item["source_id"],
+                utcnow_iso(),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return session_id
+
+    # -- analysis -----------------------------------------------------------
+
+    def run_role_analysis(self, session_id: str, role_name: str) -> list[str] | None:
+        """Run one expert role on a session, store observations."""
+        input_content = self._create_session_context(session_id)
+        prompt = get_role_prompt(self.config, role_name, "Observer")
+        response = llm_process(
+            self.config,
+            input_content=input_content,
+            prompt=prompt,
+            model=self._model,
+            expect_json=True,
+        )
+
+        observations = response if isinstance(response, list) else [response]
+        conn, cursor = get_connection(self._db)
+        note_ids: list[str] = []
+
+        for obs in observations:
+            text = obs.get("observation", "")
+            if not text:
+                continue
+
+            emb = get_embedding(self.config, text)
+            note_id = generate_id("note", session_id, role_name)
+            keywords = extract_keywords(self.config, text)
+
+            if not self.config.get("dryrun"):
+                try:
+                    cursor.execute(
+                        """INSERT INTO knowledge_records
+                           (id, type, author, content, created_at, version,
+                            embedding, session_id, keywords)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            note_id,
+                            "note",
+                            role_name,
+                            json.dumps(obs),
+                            utcnow_iso(),
+                            "1.0",
+                            emb.tobytes(),
+                            session_id,
+                            ",".join(keywords) if keywords else None,
+                        ),
+                    )
+                    conn.commit()
+                    note_ids.append(note_id)
+                except Exception:
+                    logger.exception("Error storing record %s", note_id)
+
+        conn.close()
+        return note_ids or None
+
+    def run_multiple_analyses(self, session_id: str, role_names: list[str]) -> dict[str, int]:
+        """Run all observer roles on a session, skipping already-done."""
+        conn, cursor = get_connection(self._db)
+        cursor.execute("SELECT id FROM sessions WHERE id = ?", (session_id,))
+        if not cursor.fetchone():
+            conn.close()
+            return {}
+        conn.close()
+
+        results: dict[str, int] = {}
+        for role in role_names:
+            conn, cursor = get_connection(self._db)
+            cursor.execute(
+                "SELECT COUNT(*) FROM knowledge_records WHERE session_id = ? AND author = ?",
+                (session_id, role),
+            )
+            if cursor.fetchone()[0] > 0:
+                conn.close()
+                results[role] = 0
+                continue
+            conn.close()
+
+            ids = self.run_role_analysis(session_id, role)
+            results[role] = len(ids) if ids else 0
+        return results
+
+    def get_unanalyzed_sessions(self, observer_names: list[str]) -> list[dict[str, Any]]:
+        """Return sessions missing one or more observer analyses."""
+        conn, cursor = get_connection(self._db)
+        cursor.execute("SELECT id, title, created_at FROM sessions ORDER BY created_at DESC")
+        sessions = [dict(r) for r in cursor.fetchall()]
+        incomplete: list[dict[str, Any]] = []
+
+        for sess in sessions:
+            missing: list[str] = []
+            for name in observer_names:
+                cursor.execute(
+                    "SELECT COUNT(*) FROM knowledge_records "
+                    "WHERE session_id = ? AND author = ?",
+                    (sess["id"], name),
+                )
+                if cursor.fetchone()[0] == 0:
+                    missing.append(name)
+            if missing:
+                sess["missing_observers"] = missing
+                incomplete.append(sess)
+
+        conn.close()
+        return incomplete
+
+    def update_queue_status(self, queue_id: str, status: str) -> bool:
+        try:
+            conn, cursor = get_connection(self._db)
+            cursor.execute(
+                "UPDATE analysis_queue SET status = ? WHERE id = ?",
+                (status, queue_id),
+            )
+            conn.commit()
+            conn.close()
+            return True
+        except Exception:
+            logger.exception("Error updating queue %s", queue_id)
+            return False
+
+    # -- private ------------------------------------------------------------
+
+    def _create_session_context(self, session_id: str) -> str:
+        conn, cursor = get_connection(self._db)
+        try:
+            cursor.execute(
+                """SELECT id, title, description, author, lifestage, file_path
+                   FROM sessions WHERE id = ?""",
+                (session_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                raise ValueError(f"Session {session_id} not found")
+            sess = dict(row)
+
+            ctx = f"Title: {sess['title']}\n"
+            if sess.get("description"):
+                ctx += f"Description: {sess['description']}\n"
+            ctx += f"Author: {sess['author']}\nLife Stage: {sess['lifestage']}\n---\n"
+
+            fp = sess.get("file_path")
+            if fp and Path(fp).exists():
+                ctx += read_file_fallback(fp)
+            else:
+                raise FileNotFoundError(f"Content file not found: {fp}")
+            return ctx
+        finally:
+            conn.close()
+
+
+# ---------------------------------------------------------------------------
+# ConsensusManager
+# ---------------------------------------------------------------------------
+
+
+class ConsensusManager:
+    """Cluster similar observations and generate consensus records."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    @property
+    def _db(self) -> str:
+        return loaden.get(self.config, "database.path")
+
+    def load_records(self, record_type: str = "note") -> list[dict[str, Any]]:
+        """Load records with embeddings not yet in a consensus."""
+        conn, cursor = get_connection(self._db)
+        try:
+            query = (
+                "SELECT id, content, embedding, author, type, session_id "
+                "FROM knowledge_records "
+                "WHERE embedding IS NOT NULL AND consensus_id IS NULL"
+            )
+            params: list[Any] = []
+            if record_type:
+                query += " AND type = ?"
+                params.append(record_type)
+            cursor.execute(query, params)
+
+            records: list[dict[str, Any]] = []
+            for row in cursor.fetchall():
+                if row[2]:
+                    content = json.loads(row[1])
+                    records.append(
+                        {
+                            "id": row[0],
+                            "observation": content["observation"],
+                            "domain": content.get("domain"),
+                            "life_stage": content.get("life_stage"),
+                            "confidence": content.get("confidence"),
+                            "author": row[3],
+                            "type": row[4],
+                            "session_id": row[5],
+                            "embedding": np.frombuffer(row[2], dtype=np.float32),
+                        }
+                    )
+            return records
+        finally:
+            conn.close()
+
+    def find_clusters(
+        self, threshold: float = 0.85, record_type: str = "note"
+    ) -> dict[str, Any]:
+        records = self.load_records(record_type)
+        if not records:
+            return {}
+
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for r in records:
+            groups.setdefault(r["life_stage"], []).append(r)
+
+        all_clusters: dict[str, Any] = {}
+        for life_stage, stage_records in groups.items():
+            if len(stage_records) < 2:
+                continue
+            embedding_list = [r["embedding"] for r in stage_records]
+            embeddings = np.vstack(embedding_list)
+            sims = compute_pairwise_similarities(embedding_list)
+            link = linkage(embeddings, method="complete", metric="cosine")
+            labels = fcluster(link, t=1 - threshold, criterion="distance")
+
+            buckets: dict[int, dict[str, list[Any]]] = {}
+            for idx, cid in enumerate(labels):
+                bucket = buckets.setdefault(cid, {"records": [], "indices": []})
+                rec_copy = {k: v for k, v in stage_records[idx].items() if k != "embedding"}
+                bucket["records"].append(rec_copy)
+                bucket["indices"].append(idx)
+
+            for cid, data in buckets.items():
+                if len(data["records"]) < 2:
+                    continue
+                idxs = data["indices"]
+                csim = sims[np.ix_(idxs, idxs)]
+                avg = (np.sum(csim) - len(idxs)) / (len(idxs) * (len(idxs) - 1))
+                key = f"{life_stage}_cluster_{cid}"
+                all_clusters[key] = {
+                    "life_stage": life_stage,
+                    "notes": data["records"],
+                    "average_similarity": float(avg),
+                    "unique_domains": list(
+                        {r["domain"] for r in data["records"] if r["domain"]}
+                    ),
+                    "unique_authors": list({r["author"] for r in data["records"]}),
+                }
+        return all_clusters
+
+    def find_similar_consensus(self, threshold: float = 0.92) -> dict[str, Any]:
+        clusters = self.find_clusters(threshold, record_type="consensus")
+        result: dict[str, Any] = {}
+        for cid, cluster in clusters.items():
+            if len(cluster["notes"]) > 1:
+                result[cid] = {
+                    "consensus_ids": [n["id"] for n in cluster["notes"]],
+                    "observation_count": len(cluster["notes"]),
+                    "average_similarity": cluster["average_similarity"],
+                    "observations": [n["observation"] for n in cluster["notes"]],
+                }
+        return result
+
+    def make_consensus(
+        self, cluster: dict[str, Any], author: str = "ConsensusMaker"
+    ) -> dict[str, Any] | list[Any]:
+        if len(cluster.get("notes", [])) < 2:
+            return {}
+        model = loaden.get(self.config, "llm.generative_model")
+        prompt = get_role_prompt(self.config, "ConsensusMaker", "Helper")
+        return llm_process(self.config, cluster, prompt, model)
+
+    def save_consensus(
+        self,
+        consensus: dict[str, Any],
+        author: str,
+        ts: str | None = None,
+    ) -> str:
+        ts = ts or utcnow_iso()
+        emb = get_embedding(self.config, consensus["observation"])
+        kw = extract_keywords(self.config, consensus["observation"])
+        note_id = generate_id("consensus", author, ts)
+
+        store_knowledge_record(
+            self.config,
+            note_id,
+            "consensus",
+            author,
+            consensus,
+            ts,
+            emb.tobytes(),
+            keywords=kw,
+        )
+
+        source_records = consensus.get("source_records", [])
+        if source_records:
+            conn, cursor = get_connection(self._db)
+            ph = ",".join("?" * len(source_records))
+            cursor.execute(
+                f"UPDATE knowledge_records SET consensus_id = ? WHERE id IN ({ph})",
+                [note_id, *source_records],
+            )
+            conn.commit()
+            conn.close()
+        return note_id
+
+    def process_clusters(
+        self,
+        threshold: float = 0.85,
+        kr_type: str = "note",
+        author: str = "ConsensusMaker",
+    ) -> dict[str, Any]:
+        clusters = self.find_clusters(threshold, kr_type)
+        if self.config.get("dryrun"):
+            return {"clusters": clusters}
+
+        ids: list[str] = []
+        for _cid, cluster in clusters.items():
+            consensus = self.make_consensus(cluster, author)
+            if not consensus:
+                continue
+            ts = utcnow_iso()
+            rid = self.save_consensus(consensus, author, ts)
+            ids.append(rid)
+            cluster["consensus_ids"] = rid
+
+        return {
+            "clusters": clusters,
+            "consensus_count": len(ids),
+            "cluster_count": len(clusters),
+        }
+
+    def reset_consensus(self) -> int:
+        """Delete all consensus records and unlink knowledge records."""
+        conn, cursor = get_connection(self._db)
+        try:
+            cursor.execute(
+                "UPDATE knowledge_records SET consensus_id = NULL "
+                "WHERE consensus_id IS NOT NULL"
+            )
+            cursor.execute(
+                "DELETE FROM knowledge_records "
+                "WHERE author = 'ConsensusMaker' AND type = 'consensus'"
+            )
+            conn.commit()
+            return cursor.rowcount
+        finally:
+            conn.close()
+
+    def reset_consensus_clusters(self, clusters: dict[str, Any]) -> int:
+        """Reset specific consensus clusters."""
+        conn, cursor = get_connection(self._db)
+        count = 0
+        try:
+            for cluster in clusters.values():
+                for cid in cluster.get("consensus_ids", []):
+                    cursor.execute(
+                        "UPDATE knowledge_records SET consensus_id = NULL "
+                        "WHERE consensus_id = ?",
+                        (cid,),
+                    )
+                    cursor.execute("DELETE FROM knowledge_records WHERE id = ?", (cid,))
+                    count += 1
+            conn.commit()
+        finally:
+            conn.close()
+        return count
+
+
+# ---------------------------------------------------------------------------
+# ProfileGenerator
+# ---------------------------------------------------------------------------
+
+
+class ProfileGenerator:
+    """Generate biographical profiles from knowledge records."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+        self.db_path: str = loaden.get(config, "database.path")
+
+    def dump_observations(self) -> str:
+        conn, cursor = get_connection(self.db_path)
+        cursor.execute(
+            "SELECT content FROM knowledge_records "
+            "WHERE consensus_id IS NULL ORDER BY created_at"
+        )
+        lines: list[str] = []
+        for row in cursor.fetchall():
+            with contextlib.suppress(json.JSONDecodeError):
+                lines.append(json.loads(row[0]).get("observation", ""))
+        conn.close()
+        return "\n".join(lines)
+
+    def generate_profile(self, format_type: str = "md", mode: str = "short") -> str:
+        consensus = self._get_records("consensus")
+        notes = self._get_records("note")
+        all_records = consensus + notes
+
+        if format_type == "raw":
+            return self._format_raw(all_records)
+
+        organized = self._organize(all_records)
+        content = self._synthesize(organized, mode)
+
+        if format_type == "json":
+            return json.dumps(content, indent=2)
+        return self._format_markdown(content)
+
+    # -- private ------------------------------------------------------------
+
+    def _get_records(self, record_type: str) -> list[dict[str, Any]]:
+        conn, cursor = get_connection(self.db_path)
+        try:
+            if record_type == "consensus":
+                cursor.execute(
+                    "SELECT id, content, created_at FROM knowledge_records "
+                    "WHERE type = 'consensus' ORDER BY created_at"
+                )
+            else:
+                cursor.execute(
+                    "SELECT id, content, author, created_at FROM knowledge_records "
+                    "WHERE type = ? AND consensus_id IS NULL ORDER BY created_at",
+                    (record_type,),
+                )
+            out: list[dict[str, Any]] = []
+            for row in cursor.fetchall():
+                rec: dict[str, Any] = {
+                    "id": row[0],
+                    "content": json.loads(row[1]),
+                    "created_at": row[-1],
+                }
+                if record_type != "consensus":
+                    rec["author"] = row[2]
+                out.append(rec)
+            return out
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _organize(
+        records: list[dict[str, Any]],
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        org: dict[str, dict[str, list[dict[str, Any]]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
+        for r in records:
+            c = r["content"]
+            ls = c.get("life_stage", "NOT_KNOWN")
+            if "domain" in c:
+                org[ls][c["domain"]].append(r)
+            elif "domains" in c:
+                for d in c["domains"]:
+                    org[ls][d].append(r)
+            else:
+                org[ls]["Unclassified"].append(r)
+        return org
+
+    def _synthesize(
+        self,
+        organized: dict[str, dict[str, list[dict[str, Any]]]],
+        mode: str,
+    ) -> dict[str, Any]:
+        model = loaden.get(self.config, "llm.generative_model")
+        prompt = (
+            "You are an expert biographer. Synthesize the observations into a "
+            "cohesive biographical narrative. For each life stage create a section. "
+            "Include a brief overall summary. Respond as JSON: "
+            '{"summary": "...", "life_stages": [{"stage": "...", "narrative": "..."}]}'
+        )
+        input_data: dict[str, Any] = {"mode": mode, "life_stages": {}}
+        for ls, domains in organized.items():
+            input_data["life_stages"][ls] = {}
+            for dom, recs in domains.items():
+                input_data["life_stages"][ls][dom] = [
+                    {
+                        "observation": r["content"].get("observation", ""),
+                        "confidence": r["content"].get("confidence", "MODERATE"),
+                    }
+                    for r in recs
+                ]
+        try:
+            return llm_process(
+                self.config,
+                input_content=input_data,
+                prompt=prompt,
+                model=model,
+                expect_json=True,
+            )
+        except Exception:
+            logger.exception("Profile synthesis failed")
+            return {"summary": "Error generating profile.", "life_stages": []}
+
+    @staticmethod
+    def _format_markdown(content: dict[str, Any]) -> str:
+        md = f"# Personal Profile\n\n## Summary\n\n{content.get('summary', '')}\n\n"
+        for stage in content.get("life_stages", []):
+            title = stage["stage"].replace("_", " ").title()
+            md += f"## {title}\n\n{stage['narrative']}\n\n"
+        return md
+
+    @staticmethod
+    def _format_raw(records: list[dict[str, Any]]) -> str:
+        conf_order = {"VERY_HIGH": 0, "HIGH": 1, "MODERATE": 2, "LOW": 3, "VERY_LOW": 4}
+
+        items: list[tuple[tuple[int, str, int], dict[str, Any]]] = []
+        for r in records:
+            c = r["content"]
+            ls = c.get("life_stage", "NOT_KNOWN")
+            ls_i = LIFE_STAGES.index(ls) if ls in LIFE_STAGES else 999
+            author = r.get("author", "Consensus")
+            conf = c.get("confidence", "MODERATE")
+            items.append(
+                (
+                    (ls_i, author, conf_order.get(conf, 5)),
+                    {
+                        "life_stage": ls,
+                        "author": author,
+                        "confidence": conf,
+                        "observation": c.get("observation", ""),
+                        "id": r.get("id", ""),
+                    },
+                )
+            )
+        items.sort(key=lambda x: x[0])
+
+        out = "# Raw Knowledge Records\n\n"
+        current_ls = current_author = current_conf = ""
+        for _, d in items:
+            if d["life_stage"] != current_ls:
+                current_ls = d["life_stage"]
+                out += f"## {current_ls}\n"
+                current_author = current_conf = ""
+            if d["author"] != current_author:
+                current_author = d["author"]
+                out += f"### {current_author}\n"
+                current_conf = ""
+            if d["confidence"] != current_conf:
+                current_conf = d["confidence"]
+                out += f"#### {current_conf}\n"
+            out += f"- {d['observation']} [{d['id']}]\n"
+        return out
+
+
+# ---------------------------------------------------------------------------
+# Query
+# ---------------------------------------------------------------------------
+
+
+class Query:
+    """Query knowledge records with filtering and similarity search."""
+
+    def __init__(self, config: dict[str, Any]) -> None:
+        self.config = config
+
+    def get_kr(self, **kwargs: Any) -> list[KnowledgeRecord]:
+        return get_filtered_knowledge_records(self.config, **kwargs)
+
+    def get_observations_by_similarity(
+        self,
+        topic: str,
+        threshold: float,
+        domain: list[str] | None = None,
+        lifestage: list[str] | None = None,
+        confidence: list[str] | None = None,
+    ) -> list[KnowledgeRecord]:
+        records = self.get_kr(
+            domain=domain,
+            lifestage=lifestage,
+            confidence=confidence,
+            include_embedding=True,
+        )
+        emb = get_embedding(self.config, topic)
+        emb_b64 = base64.b64encode(emb.tobytes()).decode("utf-8")
+        return [
+            r
+            for r in records
+            if r.embedding and cosine_similarity_base64(emb_b64, r.embedding) >= threshold
+        ]
+
+
+# ===========================================================================
+# CLI
+# ===========================================================================
 
 
 @click.group()
-@click.version_option(version="0.1.0")
-@click.option("--config", type=click.Path(exists=True), help="Path to config file")
-@click.option("--db-path", type=click.Path(), help="Override database path from config")
-@click.option("--model", help="Override LLM model from config")
+@click.version_option(version="0.2.0")
+@click.option("--config", "config_path", type=click.Path(exists=True), help="Config file")
+@click.option("--db-path", type=click.Path(), help="Override database path")
+@click.option("--model", help="Override LLM model")
 @click.pass_context
-def cli(ctx, config: Optional[str], db_path: Optional[str], model: Optional[str]):
-    """KnowMe - Personal knowledge management and analysis system."""
-    # Load the base configuration
-    cfg = get_config(config)
-    console.print(f"[blue]Loaded configuration from {config or 'default path'}[/blue]")
+def cli(
+    ctx: click.Context,
+    config_path: str | None,
+    db_path: str | None,
+    model: str | None,
+) -> None:
+    """KnowMe -- Personal knowledge management and analysis system."""
+    cfg = get_config(config_path)
 
-    # Apply overrides if provided
     if db_path:
-        cfg.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-
+        cfg["database"]["path"] = db_path
     if model:
-        cfg.llm.generative_model = model
-        console.print(f"[blue]Overriding LLM model: {model}[/blue]")
+        cfg["llm"]["generative_model"] = model
 
-    # Store the config in the Click context for access in subcommands
     ctx.obj = cfg
 
-    # Configure logging based on loaded config
-    log_level = cfg.logging.level
-    log_file = cfg.logging.file
+    configure_logging(
+        level=loaden.get(cfg, "logging.level"),
+        log_file=loaden.get(cfg, "logging.file"),
+    )
 
-    logger.debug(f"Updating logging configuration: level={log_level}, file={log_file}")
-    configure_logging(level=log_level, log_file=log_file)
-    logger.info(f"Logging configured with level={log_level}, file={log_file}")
+
+# -- init -------------------------------------------------------------------
 
 
 @cli.command()
 @click.argument("db_path", type=click.Path(), required=False)
 @click.pass_context
-def init(ctx, db_path: Optional[str]):
-    """
-    Initialize a new knowledge database.
-
-    DB_PATH is the path where the database will be created.
-    If not provided, uses the path from configuration.
-    """
-    config = ctx.obj
-    db_path = db_path or config.database.path
-    # Check if database already exists
-    if Path(db_path).exists():
-        console.print(f"[yellow]Warning: Database {db_path} already exists[/yellow]")
+def init(ctx: click.Context, db_path: str | None) -> None:
+    """Initialize a new knowledge database."""
+    cfg = ctx.obj
+    target = db_path or loaden.get(cfg, "database.path")
+    if Path(target).exists():
+        console.print(f"[yellow]Database {target} already exists[/yellow]")
         return
-
-    success = create_database(config, config.database.path)
-    if not success:
-        console.print(f"[red]Error creating database at {db_path}[/red]")
-        return
-
-    console.print(f"[green]Successfully created database at {db_path}[/green]")
-
-
-@cli.command()
-@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option("--queue", "-q", is_flag=True, help="Process items in the analysis queue")
-@click.option("--queue-id", help="Process a specific queue item by ID")
-@click.option(
-    "--limit",
-    "-l",
-    type=int,
-    default=1,
-    help="Maximum number of queue items to process",
-)
-@click.option("--model", "-m", help="LLM model to use (default: from config)")
-@click.option("--dryrun", is_flag=True, help="Dry run mode")
-@click.pass_context
-def analyze(
-    ctx,
-    db_path: Optional[str],
-    queue: bool,
-    queue_id: Optional[str],
-    limit: int,
-    model: Optional[str],
-    dryrun: bool,
-):
-    """
-    Run expert analysis on content in the queue.
-
-    If --queue is provided, processes the next pending item in the queue.
-    If --queue-id is provided, processes that specific queue item.
-    """
-    config = ctx.obj
-    # Apply overrides if provided
     if db_path:
-        config.database.path = db_path
-
-    if model:
-        config.llm.generative_model = model
-
-    if dryrun:
-        config.dryrun = True
-
-    observer_names = [observer.name for observer in config.roles.Observers]
-
-    analysis_manager = AnalysisManager(config)
-
-    if queue or queue_id:
-        loader = Loader(config)
-
-        if queue_id:
-            # Process specific queue item
-            console.print(f"[blue]Processing queue item {queue_id}[/blue]")
-
-            item = loader.get_source_and_queue_item(queue_id=queue_id)
-
-            if not item:
-                console.print(f"[red]Source Queue item {queue_id} not found[/red]")
-                return
-
-            logging.info(f"source_id: {item['source_id']}")
-
-            if not item["source_id"]:
-                console.print(
-                    f"[red]Queue item {queue_id} has no source_id in metadata[/red]"
-                )
-                return
-
-            # Process the item
-            session_id = analysis_manager.create_session(item)
-            logger.info(f"Process the item - session_id: {session_id}")
-
-            if session_id:
-                console.print(
-                    f"[green]Successfully analyzed queue item {queue_id}[/green]"
-                )
-                console.print(f"[green]Created session {session_id}[/green]")
-                analysis_manager.update_queue_item_status(item["id"], "completed")
-            else:
-                console.print(f"[red]Failed to analyze queue item {queue_id}[/red]")
-                analysis_manager.update_queue_item_status(item["id"], "failed")
-
-            result = analysis_manager.run_multiple_role_analyses(
-                session_id, observer_names
-            )
-            console.print(f"[blue]Results: {result} [/blue]")
-            return
-
-        else:
-            # Process next queue item
-            console.print("[blue]Processing next item in the queue...[/blue]")
-            # Get next item
-
-            items = loader.get_queue_items(status="pending", limit=limit)
-
-            if not items:
-                console.print("[yellow]Queue is empty[/yellow]")
-                return
-
-            # each queue item is a dictionary
-            for item in items:
-
-                if dryrun:
-                    console.print(
-                        f"[yellow]Would process: {item['title']} (ID: {item['id']})[/yellow]"
-                    )
-                    return
-
-                # create a session for the item
-                session_id = analysis_manager.create_session(item)
-
-                if session_id:
-                    console.print(
-                        f"[green]Successfully created session {session_id}[/green]"
-                    )
-                    analysis_manager.update_queue_item_status(item["id"], "completed")
-                else:
-                    console.print(
-                        "[yellow]No items in the queue or processing failed[/yellow]"
-                    )
-                    analysis_manager.update_queue_item_status(item["id"], "failed")
-
-                # get sessions that are not yet analyzed
-                sessions = analysis_manager.get_unanalyzed_sessions(observer_names)
-                console.print(f"[blue]Sessions: {sessions} for analysis [/blue]")
-
-                # run analysis on the sessions
-                for session in sessions:
-                    results = analysis_manager.run_multiple_role_analyses(
-                        session["id"], observer_names
-                    )
-                    console.print(f"[blue]Results: {results} [/blue]")
-
-
-@cli.command()
-@click.option("--threshold", "-t", default=0.85, help="Similarity threshold (0-1)")
-@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option("--dryrun", "dryrun", is_flag=True, help="Dry run mode")
-@click.option("--reset", is_flag=True, help="Reset all consensus records")
-@click.option(
-    "--type",
-    "kr_type",
-    type=click.Choice(["note", "fact"], case_sensitive=False),
-    default="note",
-    help="Type of records to merge",
-)
-@click.option("--list", "-l", is_flag=True, help="List clusters without merging")
-@click.option("--model", "-m", help="LLM model to use (default: from config)")
-@click.pass_context
-def merge(
-    ctx,
-    db_path: Optional[str],
-    threshold: float,
-    dryrun: bool,
-    reset: bool,
-    kr_type: str,
-    list: bool,
-    model: Optional[str],
-):
-    """
-    Find clusters of similar notes/facts and create consensus records.
-
-    Uses semantic similarity to group related observations and create
-    higher-level consensus statements.
-    """
-    config = ctx.obj
-
-    # Initialize the consensus manager
-    consensus_manager = ConsensusManager(config)
-
-    # Apply overrides if provided
-    if db_path:
-        config.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-
-    if model:
-        config.llm.generative_model = model
-        console.print(f"[blue]Overriding LLM model: {model}[/blue]")
-
-    if dryrun:
-        config.dryrun = True
+        cfg["database"]["path"] = db_path
+    if create_database(cfg):
+        console.print(f"[green]Created database at {target}[/green]")
     else:
-        config.dryrun = False
+        console.print(f"[red]Error creating database at {target}[/red]")
 
 
-
-    if reset:
-        console.print("[yellow]Resetting all consensus records...[/yellow]")
-        result = consensus_manager.reset_consensus()
-        console.print(f"[green]Reset {result} consensus records[/green]")
-        return
-
-    result = consensus_manager.process_clusters(threshold=threshold, kr_type=kr_type)
-
-    if dryrun:
-        ## loop through each cluster and print out the observations
-        for cluster_id, cluster_info in result["clusters"].items():
-                print(f"{cluster_id}")
-                
-                notes = cluster_info.get('notes', [])
-                for note in notes:
-                    observation = note.get('observation', 'No observation')
-                    print(f"  {observation}")
-                print() 
-        return
-
-    if list:
-        # Just list clusters without creating consensus
-
-        # Create a table to display clusters
-        table = Table(title=f"Observation Clusters (threshold={threshold})")
-        table.add_column("Cluster", style="cyan")
-        table.add_column("Life Stage", style="blue")
-        table.add_column("Count", style="green", justify="right")
-        table.add_column("Avg. Similarity", style="yellow", justify="right")
-        table.add_column("Domains", style="magenta")
-        table.add_column("Sample Observation", style="white")
-
-        for cluster_id, cluster in result["clusters"].items():
-            # Truncate sample observation if too long
-            sample = cluster["observations"][0]
-            if len(sample) > 60:
-                sample = sample[:57] + "..."
-
-            # Format domains as comma-separated list
-            domains = ", ".join(cluster["domains"]) if cluster["domains"] else "-"
-
-            table.add_row(
-                cluster_id,
-                cluster["life_stage"],
-                str(cluster["observation_count"]),
-                f"{cluster['average_similarity']:.2f}",
-                domains,
-                sample,
-            )
-
-        console.print(table)
-        return
-
-    # Process clusters and create consensus
-    console.print(f"[blue]Finding clusters with threshold {threshold}...[/blue]")
-
-    try:
-        if not result["clusters"]:
-            console.print(
-                "[yellow]No clusters found with the current threshold.[/yellow]"
-            )
-            return
-
-        if not dryrun:
-            console.print(
-                f"[green] Actual merge complete with threshold {threshold}[/green]"
-            )
-
-        if dryrun:
-            console.print(
-                f"Would create approximately {len(result['clusters'])} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations"
-            )
-        else:
-            console.print(
-                f"Created {result['consensus_count']} consensus records from {sum(len(c['notes']) for c in result['clusters'].values())} individual observations"
-            )
-
-    except Exception as e:
-        console.print(f"[red]Error during consensus processing: {str(e)}[/red]")
-        logging.exception("Error during consensus processing")
+# -- load -------------------------------------------------------------------
 
 
 @cli.command()
 @click.argument("file_patterns", nargs=-1, type=click.Path())
-@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option(
-    "--name", "-n", help="Name template for the content (use {index} for batch)"
-)
-@click.option("--author", "-a", help="Creator or source of the content")
+@click.option("--name", "-n", help="Name template ({index} for batch)")
+@click.option("--author", "-a", help="Content author")
+@click.option("--description", "-d", help="Content description")
 @click.option(
     "--lifestage",
     "-l",
-    type=click.Choice(
-        [
-            "CHILDHOOD",
-            "ADOLESCENCE",
-            "EARLY_ADULTHOOD",
-            "EARLY_CAREER",
-            "MID_CAREER",
-            "LATE_CAREER",
-            "AUTO",
-        ],
-        case_sensitive=False,
-    ),
+    type=click.Choice([*LIFE_STAGES, "AUTO"], case_sensitive=False),
     default="AUTO",
-    help="Life stage for this content",
 )
-@click.option(
-    "--type",
-    "-t",
-    type=click.Choice(["document", "qa"], case_sensitive=False),
-    help="Type of content to queue",
-)
-@click.option("--qa", is_flag=True, help="Process content as QA transcript/interview")
-@click.option("--list", is_flag=True, help="List queue contents or matched files")
-@click.option(
-    "--dryrun", is_flag=True, help="Show what would be queued without making changes"
-)
+@click.option("--priority", "-p", type=int, default=0)
+@click.option("--list", "list_queue", is_flag=True, help="List queue contents")
+@click.option("--dryrun", is_flag=True)
 @click.pass_context
-def queue(
-    ctx,
-    db_path: Optional[str],
-    file_patterns: tuple,
-    name: Optional[str],
-    author: Optional[str],
-    lifestage: Optional[str],
-    type: Optional[str],
-    qa: bool,
-    list: bool,
+def load(
+    ctx: click.Context,
+    file_patterns: tuple[str, ...],
+    name: str | None,
+    author: str | None,
+    description: str | None,
+    lifestage: str,
+    priority: int,
+    list_queue: bool,
     dryrun: bool,
-):
-    """
-    Add content to the analysis queue or process QA transcripts.
+) -> None:
+    """Load documents as sources and enqueue for analysis."""
+    cfg = ctx.obj
+    author_name = author or loaden.get(cfg, "content.default_author", "")
+    if not author_name and not list_queue:
+        console.print("[red]Author required (--author or config default_author)[/red]")
+        return
 
-    FILE_PATTERNS are glob patterns for files to analyze (e.g. "docs/*.txt" "notes/**/*.md")
-    Multiple patterns can be provided to queue multiple files.
+    loader = Loader(cfg)
 
-    For batch queuing, use {index} in the name template, e.g. "Journal Entry {index}"
-
-    If --qa is specified, processes content as QA transcript/interview directly into sessions.
-    Otherwise, adds content to the analysis queue for later processing.
-
-    Use --list without FILE_PATTERNS to show current queue contents,
-    or with FILE_PATTERNS to preview matched files.
-
-    Author can be specified via --author flag or in config.yaml under content.default_author.
-    Life stage and type are required when processing content but can be omitted for --list operations.
-    """
-    config = ctx.obj
-    # Apply overrides if provided
-    if db_path:
-        config.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-
-    # List mode is dominant mode. If --list is provided, ignore other options.
-
-    ## ANALYSIS QUEUE tabel is for documents not sessions
-    if list:
-        conn, cursor = get_connection(config.database.path)
-        cursor.execute(
-            """
-            SELECT id, name, author, lifestage, type, filename, created_at, status
-            FROM analysis_queue 
-            ORDER BY priority DESC, created_at DESC
-        """
-        )
-        queue_items = cursor.fetchall()
-        conn.close()
-
-        if not queue_items:
-            console.print("[yellow]Queue is empty[/yellow]")
-            return
-
+    if list_queue:
+        items = loader.get_queue_items(status="pending")
         table = Table(title="Analysis Queue")
-        table.add_column("ID", style="red")
-        table.add_column("Name", style="green")
-        table.add_column("Author", style="yellow")
-        table.add_column("Life Stage", style="blue")
-        table.add_column("Type", style="magenta")
-        table.add_column("File", style="cyan")
-        table.add_column("Status", style="white")
-
-        for item in queue_items:
-            table.add_row(item[0], item[1], item[2], item[3], item[4], item[5], item[7])
-
+        for col in ("ID", "Title", "Author", "Life Stage", "Status", "Priority"):
+            table.add_column(col)
+        for it in items:
+            table.add_row(
+                it["id"],
+                it["title"],
+                it["author"],
+                it["lifestage"],
+                it["status"],
+                str(it["priority"]),
+            )
         console.print(table)
         return
 
-    # Require file patterns for non-list operations
     if not file_patterns:
-        console.print("[red]Error: FILE_PATTERNS required when not using --list[/red]")
+        console.print("[red]FILE_PATTERNS required when not using --list[/red]")
         return
 
-    # Get author from CLI or config
-    effective_author = author or config.content.default_author
-
-    # Check if we need author for the operation
-    if not effective_author:
-        console.print(
-            "[red]Error: Author required. Specify with --author or set default_author in config[/red]"
-        )
-        return
-
-    # Check if we need lifestage for the operation
-    if not lifestage:
-        console.print(
-            "[red]Error: Life stage required when processing content. Use --lifestage to specify[/red]"
-        )
-        return
-
-    # Determine effective type
-    effective_type = "qa" if qa else type
-
-    # Check if we need type for the operation
-    if not effective_type:
-        console.print(
-            "[red]Error: Type required when processing content. Use --type to specify[/red]"
-        )
-        return
-
-    # Expand glob patterns to get matched files
-
-    matched_files = resolve_file_patterns(file_patterns)
-
-    if not matched_files:
-        console.print("[yellow]No files matched the provided patterns[/yellow]")
+    matched = resolve_file_patterns(file_patterns)
+    if not matched:
+        console.print("[yellow]No files matched[/yellow]")
         return
 
     if dryrun:
         table = Table(title="Matched Files")
-        table.add_column("Index", style="cyan")
-        table.add_column("Path", style="green")
-        table.add_column("Size", style="blue")
-
-        for idx, file_path in enumerate(matched_files, 1):
-            size = os.path.getsize(file_path)
-            size_str = (
-                f"{size/1024:.1f}KB"
-                if size < 1024 * 1024
-                else f"{size/1024/1024:.1f}MB"
-            )
-            table.add_row(str(idx), file_path, size_str)
-
+        table.add_column("Index")
+        table.add_column("Path")
+        table.add_column("Size")
+        for i, fp in enumerate(matched, 1):
+            size = Path(fp).stat().st_size
+            table.add_row(str(i), fp, f"{size / 1024:.1f}KB")
         console.print(table)
         return
 
-    invalid_files = []
-    for file_path in matched_files:
-        try:
-            # Check if file is readable
-            with open(file_path, "r", encoding="utf-8") as f:
-                f.read(1024)  # Try reading first 1KB
+    result = loader.batch_load(
+        file_patterns=matched,
+        name_template=name,
+        author=author_name,
+        description=description or "",
+        lifestage=lifestage,
+        priority=priority,
+    )
+    console.print(
+        f"[green]Loaded {len(result['loaded_files'])} of "
+        f"{len(result['matched_files'])} files[/green]"
+    )
 
-            # Check file size (warn if >10MB)
-            if os.path.getsize(file_path) > 10 * 1024 * 1024:
-                invalid_files.append((file_path, "File size exceeds 10MB"))
 
-        except Exception as e:
-            invalid_files.append((file_path, str(e)))
-
-    if invalid_files:
-        console.print("[yellow]Warning: Some files failed validation:[/yellow]")
-        for file_path, error in invalid_files:
-            console.print(f"[red]- {file_path}: {error}[/red]")
-        if not click.confirm("Do you want to continue with valid files?"):
-            return
-        # Remove invalid files
-        matched_files = [
-            f for f in matched_files if f not in [x[0] for x in invalid_files]
-        ]
-
-    # Handle QA content differently - process directly into sessions
-    if qa:
-        for file_path in matched_files:
-            if not Path(file_path).exists():
-                console.print(f"[red]Error: File {file_path} not found[/red]")
-                return
-
-            # Read content
-            content = None
-            source_name = Path(file_path).absolute()
-            console.print(f"[blue]Reading content from {source_name}...[/blue]")
-            try:
-                content = Path(file_path).read_text()
-                logger.info(f"Content read from {source_name}")
-                logger.debug(f"Word Count: {len(content.split())}")
-            except Exception as e:
-                console.print(f"[red]Error reading content: {str(e)}[/red]")
-                return
-
-            try:
-                # Process the transcript
-                session_id = process_content(
-                    config.database.path,
-                    content,
-                    name or Path(file_path).stem,
-                    effective_author,
-                    lifestage,
-                    "qa",
-                    Path(file_path).name,
-                )
-
-                if session_id:
-                    console.print(
-                        f"[green]Successfully processed transcript into session {session_id}[/green]"
-                    )
-                    console.print(
-                        Panel(
-                            f"[bold]Session ID:[/bold] {session_id}",
-                            title="Transcript Processing Complete",
-                            border_style="green",
-                        )
-                    )
-                else:
-                    console.print(
-                        "[yellow]No Q&A pairs found in the transcript[/yellow]"
-                    )
-            except Exception as e:
-                console.print(f"[red]Error processing transcript: {str(e)}[/red]")
-        return
-
-    # Regular queue processing for documents
-
-    # Validate files before queuing
-
-    # Show queuing preview
-    table = Table(title="Files to Queue")
-    table.add_column("Index", style="cyan")
-    table.add_column("Name", style="green")
-    table.add_column("File", style="blue")
-    table.add_column("Type", style="magenta")
-    table.add_column("Life Stage", style="yellow")
-
-    from datetime import datetime
-
-    timestamp = datetime.utcnow().isoformat()
-
-    queue_items = []
-    for idx, file_path in enumerate(matched_files, 1):
-        # Generate name if template provided
-        item_name = (
-            name.format(index=idx)
-            if name and "{index}" in name
-            else name or os.path.splitext(os.path.basename(file_path))[0]
-        )
-
-        # Generate queue ID
-
-        item_id = generate_id("queue", file_path, timestamp, idx)
-
-        queue_items.append(
-            {
-                "id": item_id,
-                "name": item_name,
-                "author": effective_author,
-                "lifestage": lifestage,
-                "type": effective_type,
-                "filename": str(Path(file_path).absolute()),
-                "created_at": timestamp,
-                "status": "pending",
-                "expert_status": "{}",
-                "fact_status": "{}",
-            }
-        )
-
-        table.add_row(
-            str(idx), item_name, os.path.basename(file_path), effective_type, lifestage
-        )
-
-    console.print(table)
-
-    if dry_run:
-        return
-
-    if not click.confirm("Do you want to queue these files?"):
-        return
-
-    # Queue the files
-
-    try:
-        for item in queue_items:
-            file_queue_id = process_content(
-                config.database.path,
-                item["filename"],
-                item["name"],
-                item["author"],
-                item["lifestage"],
-                item["type"],
-                item["filename"],
-            )
-
-        console.print(
-            f"[green]Successfully queued {len(queue_items)} files for analysis[/green]"
-        )
-
-        # Show queue IDs in a panel
-        ids_text = "\n".join(
-            [f"[bold]{item['name']}:[/bold] {item['id']}" for item in queue_items]
-        )
-        console.print(Panel(ids_text, title="Queue IDs", border_style="green"))
-
-    except Exception as e:
-        conn.rollback()
-        console.print(f"[red]Error queueing files: {str(e)}[/red]")
+# -- analyze ----------------------------------------------------------------
 
 
 @cli.command()
-@click.option("--threshold", "-t", default=0.92, help="Similarity threshold (0-1)")
-@click.option("--db", "db_path", type=click.Path(exists=True), required=False)
-@click.option("--reset", "-r", is_flag=True, help="Reset similar consensus records")
-@click.option(
-    "--dryrun", is_flag=True, help="Show what would be reset without making changes"
-)
-@click.option(
-    "--no-list", is_flag=True, help="Skip detailed listing of consensus records"
-)
+@click.option("--queue", "-q", is_flag=True, help="Process queue items")
+@click.option("--queue-id", help="Process specific queue item")
+@click.option("--limit", "-l", type=int, default=1)
+@click.option("--model", "-m", help="Override LLM model")
+@click.option("--dryrun", is_flag=True)
+@click.pass_context
+def analyze(
+    ctx: click.Context,
+    queue: bool,
+    queue_id: str | None,
+    limit: int,
+    model: str | None,
+    dryrun: bool,
+) -> None:
+    """Run expert analysis on queued content."""
+    cfg = ctx.obj
+    if model:
+        cfg["llm"]["generative_model"] = model
+    if dryrun:
+        cfg["dryrun"] = True
+
+    observer_names = [o["name"] for o in loaden.get(cfg, "roles.Observers", [])]
+    mgr = AnalysisManager(cfg)
+
+    if not (queue or queue_id):
+        console.print("[yellow]Use --queue or --queue-id[/yellow]")
+        return
+
+    loader = Loader(cfg)
+
+    if queue_id:
+        item = loader.get_source_and_queue_item(queue_id=queue_id)
+        if not item:
+            console.print(f"[red]Queue item {queue_id} not found[/red]")
+            return
+        sid = mgr.create_session(item)
+        if sid:
+            mgr.update_queue_status(item["id"], "completed")
+            result = mgr.run_multiple_analyses(sid, observer_names)
+            console.print(f"[green]Analyzed session {sid}: {result}[/green]")
+        else:
+            console.print("[yellow]Session already exists[/yellow]")
+        return
+
+    items = loader.get_queue_items(status="pending", limit=limit)
+    if not items:
+        console.print("[yellow]Queue is empty[/yellow]")
+        return
+
+    for item in items:
+        if dryrun:
+            console.print(f"[yellow]Would process: {item['title']}[/yellow]")
+            continue
+        sid = mgr.create_session(item)
+        if sid:
+            mgr.update_queue_status(item["id"], "completed")
+        else:
+            mgr.update_queue_status(item["id"], "failed")
+            continue
+
+        for sess in mgr.get_unanalyzed_sessions(observer_names):
+            mgr.run_multiple_analyses(sess["id"], observer_names)
+
+
+# -- merge ------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--threshold", "-t", default=0.85)
+@click.option("--dryrun", is_flag=True)
+@click.option("--reset", is_flag=True)
+@click.option("--type", "kr_type", type=click.Choice(["note", "fact"]), default="note")
+@click.option("--list", "list_clusters", is_flag=True)
+@click.option("--model", "-m", help="Override model")
+@click.pass_context
+def merge(
+    ctx: click.Context,
+    threshold: float,
+    dryrun: bool,
+    reset: bool,
+    kr_type: str,
+    list_clusters: bool,
+    model: str | None,
+) -> None:
+    """Cluster similar observations and create consensus records."""
+    cfg = ctx.obj
+    if model:
+        cfg["llm"]["generative_model"] = model
+    if dryrun:
+        cfg["dryrun"] = True
+
+    cm = ConsensusManager(cfg)
+
+    if reset:
+        n = cm.reset_consensus()
+        console.print(f"[green]Reset {n} consensus records[/green]")
+        return
+
+    result = cm.process_clusters(threshold=threshold, kr_type=kr_type)
+
+    if dryrun:
+        for cid, info in result["clusters"].items():
+            console.print(f"[cyan]{cid}[/cyan]")
+            for note in info.get("notes", []):
+                console.print(f"  {note.get('observation', '')}")
+            console.print()
+        return
+
+    if list_clusters:
+        table = Table(title=f"Clusters (threshold={threshold})")
+        table.add_column("Cluster")
+        table.add_column("Count", justify="right")
+        table.add_column("Avg Similarity", justify="right")
+        for cid, cluster in result["clusters"].items():
+            table.add_row(
+                cid,
+                str(len(cluster["notes"])),
+                f"{cluster['average_similarity']:.2f}",
+            )
+        console.print(table)
+        return
+
+    console.print(
+        f"[green]Created {result['consensus_count']} consensus records "
+        f"from {result['cluster_count']} clusters[/green]"
+    )
+
+
+# -- consensus --------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--threshold", "-t", default=0.92)
+@click.option("--reset", "-r", is_flag=True)
+@click.option("--dryrun", is_flag=True)
 @click.pass_context
 def consensus(
-    ctx,
-    db_path: Optional[str],
+    ctx: click.Context,
     threshold: float,
     reset: bool,
     dryrun: bool,
-    no_list: bool,
-):
-    """
-    Manage consensus records.
+) -> None:
+    """Find and optionally reset similar consensus records."""
+    cfg = ctx.obj
+    cm = ConsensusManager(cfg)
+    clusters = cm.find_similar_consensus(threshold)
 
-    Find similar consensus records that might need to be reset.
-    By default, shows a list of similar consensus record clusters.
-
-    Use --reset to reset the similar consensus records, unlinking their
-    source records to allow re-clustering.
-
-    Use --dryrun with --reset to see what would be reset without making changes.
-
-    Use --no-list to skip the detailed listing (useful for scripts).
-    """
-    config = ctx.obj
-    if db_path:
-        config.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-
-    if dryrun:
-        config.dryrun = True
-
-    consensus_manager = ConsensusManager(config)
-
-    # Find similar consensus records
-    console.print(
-        f"[blue]Finding similar consensus records with threshold {threshold}...[/blue]"
-    )
-    consensus_clusters = consensus_manager.find_similar_consensus(threshold)
-
-    if not consensus_clusters:
-        console.print(
-            "[yellow]No similar consensus records found with the current threshold.[/yellow]"
-        )
+    if not clusters:
+        console.print("[yellow]No similar consensus records found[/yellow]")
         return
 
-    # Display results unless --no-list is specified
-    if not no_list:
-        table = Table(title=f"Similar Consensus Records (threshold={threshold})")
-        table.add_column("Cluster", style="cyan")
-        table.add_column("Count", style="green", justify="right")
-        table.add_column("Avg. Similarity", style="yellow", justify="right")
-        table.add_column("Records", style="magenta")
-        table.add_column("Sample Observation", style="white")
+    table = Table(title=f"Similar Consensus (threshold={threshold})")
+    table.add_column("Cluster")
+    table.add_column("Count", justify="right")
+    table.add_column("Avg Similarity", justify="right")
+    for cid, c in clusters.items():
+        table.add_row(cid, str(c["observation_count"]), f"{c['average_similarity']:.2f}")
+    console.print(table)
 
-        total_records = 0
-        for cluster_id, cluster in consensus_clusters.items():
-            record_ids = ", ".join(cluster["consensus_ids"][:3])
-            if len(cluster["consensus_ids"]) > 3:
-                record_ids += f"... (+{len(cluster['consensus_ids']) - 3} more)"
-
-            # Truncate sample observation if too long
-            sample = cluster["observations"][0]
-            if len(sample) > 60:
-                sample = sample[:57] + "..."
-
-            table.add_row(
-                cluster_id,
-                str(cluster["observation_count"]),
-                f"{cluster['average_similarity']:.2f}",
-                record_ids,
-                sample,
-            )
-            total_records += cluster["observation_count"]
-
-        console.print(table)
-        console.print(
-            f"[blue]Found {len(consensus_clusters)} clusters containing {total_records} consensus records[/blue]"
-        )
-
-    # Reset if requested
     if reset:
-        total_count = sum(c["observation_count"] for c in consensus_clusters.values())
-
         if dryrun:
-            console.print(
-                f"[yellow]Would reset {total_count} consensus records in {len(consensus_clusters)} clusters[/yellow]"
-            )
-            # Show what would happen to each cluster
-            for cluster_id, cluster in consensus_clusters.items():
-                console.print(
-                    f"  - Cluster {cluster_id}: {cluster['observation_count']} records would be reset"
-                )
+            total = sum(c["observation_count"] for c in clusters.values())
+            console.print(f"[yellow]Would reset {total} records[/yellow]")
         else:
-            reset_count = consensus_manager.reset_consensus_clusters(consensus_clusters)
-            console.print(f"[green]Reset {reset_count} consensus records[/green]")
+            n = cm.reset_consensus_clusters(clusters)
+            console.print(f"[green]Reset {n} consensus records[/green]")
+
+
+# -- queue ------------------------------------------------------------------
 
 
 @cli.command()
 @click.argument("file_patterns", nargs=-1, type=click.Path())
-@click.option("--db", "db_path", type=click.Path(exists=True))
-@click.option(
-    "--name", "-n", help="Name template for the content (use {index} for batch)"
-)
-@click.option("--author", "-a", help="Creator or source of the content")
-@click.option(
-    "--description",
-    "-d",
-    help="Description of the content (e.g., 'QA transcript with subject')",
-)
+@click.option("--name", "-n")
+@click.option("--author", "-a")
 @click.option(
     "--lifestage",
     "-l",
-    type=click.Choice(
-        [
-            "CHILDHOOD",
-            "ADOLESCENCE",
-            "EARLY_ADULTHOOD",
-            "EARLY_CAREER",
-            "MID_CAREER",
-            "LATE_CAREER",
-            "AUTO",
-        ],
-        case_sensitive=False,
-    ),
+    type=click.Choice([*LIFE_STAGES, "AUTO"], case_sensitive=False),
     default="AUTO",
-    help="Life stage for this content",
 )
-@click.option(
-    "--priority",
-    "-p",
-    type=int,
-    default=0,
-    help="Processing priority (higher numbers = higher priority)",
-)
-@click.option("--list", is_flag=True, help="List items in the queue")
-@click.option(
-    "--dryrun", is_flag=True, help="Show what would be loaded without making changes"
-)
+@click.option("--type", "-t", "content_type", type=click.Choice(["document", "qa"]))
+@click.option("--qa", is_flag=True, help="Process as QA transcript")
+@click.option("--list", "list_queue", is_flag=True)
+@click.option("--dryrun", is_flag=True)
 @click.pass_context
-def load(
-    ctx,
-    db_path: Optional[str],
-    file_patterns: tuple,
-    name: Optional[str],
-    author: Optional[str],
-    description: Optional[str],
-    lifestage: Optional[str],
-    priority: int,
-    list: bool,
+def queue(
+    ctx: click.Context,
+    file_patterns: tuple[str, ...],
+    name: str | None,
+    author: str | None,
+    lifestage: str,
+    content_type: str | None,
+    qa: bool,
+    list_queue: bool,
     dryrun: bool,
-):
-    """
-    Add documents as sources, and update the queue.
+) -> None:
+    """Add content to the analysis queue or ingest QA transcripts."""
+    cfg = ctx.obj
+    db_path = loaden.get(cfg, "database.path")
 
-    FILE_PATTERNS are glob patterns for files to analyze (e.g. "docs/*.txt" "notes/**/*.md")
-    Multiple patterns can be provided to load multiple files.
-
-    For batch loading, use {index} in the name template, e.g. "Journal Entry {index}"
-
-    Author can be specified via --author flag or in config.yaml under content.default_author.
-    """
-    config = ctx.obj
-    if db_path:
-        config.database.path = db_path
-
-    author_name = author or config.content.default_author
-    if not author_name:
-        console.print(
-            "[red]Error: Author required. Specify with --author or set default_author in config[/red]"
+    if list_queue:
+        conn, cursor = get_connection(db_path)
+        cursor.execute(
+            "SELECT id, author, lifestage, type, status, created_at "
+            "FROM analysis_queue ORDER BY priority DESC, created_at DESC"
         )
-        return
-
-    description = description or f"No description provided."
-
-    # Create loader instance
-    loader = Loader(config)
-
-    # Handle --list option - show queue contents
-    if list:
-        queue_items = loader.get_queue_items(status="pending")
-        # Display queue contents
+        rows = cursor.fetchall()
+        conn.close()
+        if not rows:
+            console.print("[yellow]Queue is empty[/yellow]")
+            return
         table = Table(title="Analysis Queue")
-        table.add_column("ID", style="cyan")
-        table.add_column("Title", style="green")
-        table.add_column("File", style="magenta")
-        table.add_column("Description", style="green")
-        table.add_column("Author", style="blue")
-        table.add_column("Life Stage", style="yellow")
-        table.add_column("Status", style="white")
-        table.add_column("Priority", style="red")
-
-        for item in queue_items:
-            table.add_row(
-                item["id"],
-                item["title"],
-                os.path.basename(item["content_path"]),
-                item["description"],
-                item["author"],
-                item["lifestage"],
-                item["status"],
-                str(item["priority"]),
-            )
-        console.print(table)
-
-        ## session with outstanding analysis
-        analysis_manager = AnalysisManager(config)
-        observer_names = [observer.name for observer in config.roles.Observers]
-        sessions = analysis_manager.get_unanalyzed_sessions(observer_names)
-        table = Table(title="Sessions with outstanding analysis")
-        table.add_column("ID", style="red")
-        table.add_column("Title", style="green")
-        table.add_column("Missing Observers", style="magenta")
-
-        for session in sessions:
-            table.add_row(
-                session["id"], session["title"], ", ".join(session["missing_observers"])
-            )
-
+        for col in ("ID", "Author", "Life Stage", "Type", "Status"):
+            table.add_column(col)
+        for r in rows:
+            table.add_row(r[0], r[1], r[2], r[3], r[4])
         console.print(table)
         return
 
-    # Require file patterns when not listing
     if not file_patterns:
-        console.print("[red]Error: FILE_PATTERNS required when not using --list[/red]")
+        console.print("[red]FILE_PATTERNS required[/red]")
         return
 
-    # Resolve file patterns to get matched files
-    matched_files = resolve_file_patterns(file_patterns)
-    if not matched_files:
-        console.print("[yellow]No files matched the provided patterns[/yellow]")
+    effective_author = author or loaden.get(cfg, "content.default_author", "")
+    if not effective_author:
+        console.print("[red]Author required[/red]")
         return
 
-    # Display files that will be processed
-    table = Table(title="Files to Load")
-    table.add_column("Index", style="cyan")
-    table.add_column("Title", style="green")
-    table.add_column("File", style="magenta")
-    table.add_column("Description", style="green")
-    table.add_column("Author", style="blue")
-    table.add_column("Life Stage", style="yellow")
+    eff_type = "qa" if qa else content_type
+    if not eff_type:
+        console.print("[red]--type or --qa required[/red]")
+        return
 
-    for idx, file_path in enumerate(matched_files, 1):
-        # Generate name if template provided
-        item_name = (
-            name.format(index=idx)
-            if name and "{index}" in name
-            else name or os.path.splitext(os.path.basename(file_path))[0]
-        )
-
-        table.add_row(
-            str(idx),
-            item_name,
-            os.path.basename(file_path),
-            description,
-            author_name,
-            lifestage,
-        )
-
-    console.print(table)
+    matched = resolve_file_patterns(file_patterns)
+    if not matched:
+        console.print("[yellow]No files matched[/yellow]")
+        return
 
     if dryrun:
+        for i, fp in enumerate(matched, 1):
+            console.print(f"  {i}. {fp}")
         return
 
-    # Process the files
-    result = loader.batch_load(
-        file_patterns=file_patterns,
-        name_template=name,
-        author=author,
-        description=description,
-        lifestage=lifestage,
-        priority=priority,
-    )
+    if qa:
+        for fp in matched:
+            content = read_file_fallback(fp)
+            sid = ingest_qa_content(
+                db_path,
+                content,
+                name or Path(fp).stem,
+                effective_author,
+                lifestage,
+                Path(fp).name,
+            )
+            if sid:
+                console.print(f"[green]Ingested {fp} -> session {sid}[/green]")
+            else:
+                console.print(f"[yellow]No QA pairs found in {fp}[/yellow]")
 
-    console.print(
-        f"[green]Successfully loaded {len(result['loaded_files'])} of {len(matched_files)} files[/green]"
-    )
 
-    # Show loaded file details
-    if result["loaded_files"]:
-        details_table = Table(title="Loaded Files")
-        details_table.add_column("Name", style="green")
-        details_table.add_column("Source ID", style="cyan")
-
-        for i, source_id in enumerate(result["source_ids"]):
-            file_name = os.path.basename(result["loaded_files"][i])
-            details_table.add_row(file_name, source_id)
-
-        console.print(details_table)
+# -- profile ----------------------------------------------------------------
 
 
 @cli.command()
-@click.argument("db_path", type=click.Path(exists=True), required=False)
-@click.option("--output", "-o", type=click.Path(), help="Output file path")
-@click.option("--dump", "-d", is_flag=True, help="Juest output the domain and content as JSON")
+@click.option("--output", "-o", type=click.Path())
+@click.option("--dump", "-d", is_flag=True, help="Dump raw observations")
 @click.option(
     "--format",
     "-f",
-    type=click.Choice(["md", "json", "raw"], case_sensitive=False),
+    "fmt",
+    type=click.Choice(["md", "json", "raw"]),
     default="md",
-    help="Output format (raw = unsynthesized data)",
 )
-@click.option(
-    "--mode",
-    "-m",
-    type=click.Choice(["short", "long"], case_sensitive=False),
-    default="short",
-    help="Length of profile (ignored for raw format)",
-)
+@click.option("--mode", "-m", type=click.Choice(["short", "long"]), default="short")
 @click.pass_context
 def profile(
-    ctx,
-    db_path: Optional[str],
-    output: Optional[str],
-    format: str,
-    mode: str,
+    ctx: click.Context,
+    output: str | None,
     dump: bool,
-):
-    """
-    Generate a profile from the knowledge base.
-
-    Creates a formatted profile document based on consensus records and notes.
-
-    Formats:
-      - md: Markdown format with narrative synthesis
-      - json: JSON structured format with narrative synthesis
-      - raw: Raw knowledge records without narrative synthesis
-
-    Modes (for md and json formats only):
-      - short: Concise synthesized profile
-      - long: Detailed synthesized profile
-    """
-    config = ctx.obj
-    # Call the profile generator
-    from core.profile import ProfileGenerator
-    profile_generator = ProfileGenerator(config)
-
-    # Apply overrides if provided
-    if db_path:
-        config.database.path = db_path
-        console.print(f"[blue]Overriding database path: {db_path}[/blue]")
-
-    if not db_path and not config.database.path:
-        console.print(
-            f"[red]Error: No database path provided and not found in configuration[/red]"
-        )
-        return
+    fmt: str,
+    mode: str,
+) -> None:
+    """Generate a profile from the knowledge base."""
+    cfg = ctx.obj
+    gen = ProfileGenerator(cfg)
 
     if dump:
-        print(profile_generator.dump_observations())
+        console.print(gen.dump_observations())
         return
 
+    with Progress() as progress:
+        task = progress.add_task("[cyan]Generating profile...", total=1)
+        content = gen.generate_profile(fmt, mode)
+        progress.update(task, advance=1)
 
-    if format == "raw":
-        console.print("[blue]Generating raw knowledge records...[/blue]")
+    if output:
+        Path(output).write_text(content, encoding="utf-8")
+        console.print(f"[green]Profile written to {output}[/green]")
     else:
-        console.print(f"[blue]Generating {mode} profile in {format} format...[/blue]")
+        console.print(Panel(content))
 
-    try:
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Generating profile...", total=1)
 
-            # Generate the profile
-            profile_content = profile_generator.generate_profile(format, mode)
+# -- regen-embeddings -------------------------------------------------------
 
-            progress.update(task, advance=1)
 
-        # Output the profile
-        if output:
-            with open(output, "w") as f:
-                f.write(profile_content)
-            console.print(f"[green]Profile written to {output}[/green]")
-        else:
-            if format == "raw":
-                console.print("\n[bold]Raw Knowledge Records:[/bold]\n")
-            else:
-                console.print("\n[bold]Profile:[/bold]\n")
+@cli.command("regen-embeddings")
+@click.option("--batch-size", type=int, default=100)
+@click.option("--dryrun", is_flag=True)
+@click.pass_context
+def regen_embeddings(ctx: click.Context, batch_size: int, dryrun: bool) -> None:
+    """Regenerate embeddings for all knowledge records."""
+    cfg = ctx.obj
+    db_path = loaden.get(cfg, "database.path")
+    emb_model = loaden.get(cfg, "llm.embedding_model")
+    console.print(f"[blue]Using model: {emb_model}[/blue]")
 
-            # For long output, it's better to show it in a scrollable panel
-            console.print(Panel(profile_content))
+    conn, cursor = get_connection(db_path)
+    cursor.execute("SELECT COUNT(*) FROM knowledge_records")
+    total = cursor.fetchone()[0]
+    conn.close()
+    console.print(f"[blue]Total records: {total}[/blue]")
 
-    except Exception as e:
-        console.print(f"[red]Error generating profile: {str(e)}[/red]")
-        logger.exception("Error generating profile")
+    offset = 0
+    processed = success = failed = 0
 
+    while True:
+        conn, cursor = get_connection(db_path)
+        cursor.execute(
+            "SELECT id, content FROM knowledge_records LIMIT ? OFFSET ?",
+            (batch_size, offset),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+
+        if not rows:
+            break
+
+        for row in rows:
+            try:
+                content = json.loads(row[1])
+                text = content.get("observation") or content.get("content", "")
+                if not text:
+                    continue
+
+                emb = get_embedding(cfg, text)
+
+                if not dryrun:
+                    conn2, cur2 = get_connection(db_path)
+                    cur2.execute(
+                        "UPDATE knowledge_records SET embedding = ? WHERE id = ?",
+                        (emb.tobytes(), row[0]),
+                    )
+                    conn2.commit()
+                    conn2.close()
+
+                success += 1
+            except Exception:
+                logger.exception("Failed for record %s", row[0])
+                failed += 1
+            processed += 1
+
+        offset += batch_size
+
+    console.print(f"[green]Done: {processed} processed, {success} ok, {failed} failed[/green]")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     cli()

@@ -170,5 +170,21 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# Private data
+private/
+
+# Deprecated files (kept locally, not tracked)
+core/
+knowme_mcp.py
+knowme_mcp_server.py
+process_consensus.py
+find_note_clusters.py
+get_profile2.py
+tst.py
+query_test.py
+myconfig.yaml
+example.config.yaml
+requirements.txt
+
 # PyPI configuration file
 .pypirc
