@@ -15,6 +15,11 @@ dependencies = [
     "scipy>=1.15",
 ]
 
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
 [project.scripts]
 knowme = "knowme:cli"
 
@@ -32,6 +37,9 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "S", "B", "C4", "SIM", "RUF"]
 ignore = ["S608"]  # SQL injection - we use parameterized queries
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101"]  # assert is fine in tests
 
 [tool.ruff.format]
 quote-style = "double"

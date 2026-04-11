@@ -20,8 +20,10 @@ import json
 import logging
 import os
 import re
+import shutil
 import sqlite3
 from collections import defaultdict
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -32,6 +34,7 @@ import click
 import llm as llm_lib
 import loaden
 import numpy as np
+import yaml
 from openai import OpenAI
 from rich.console import Console
 from rich.logging import RichHandler
@@ -39,6 +42,34 @@ from rich.panel import Panel
 from rich.progress import Progress
 from rich.table import Table
 from scipy.cluster.hierarchy import fcluster, linkage
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+VERSION = "0.2.0"
+
+# Default similarity thresholds
+DEFAULT_MERGE_THRESHOLD = 0.85
+DEFAULT_CONSENSUS_THRESHOLD = 0.92
+
+# Session output filenames
+SESSION_DB_NAME = "session.db"
+SESSION_CONFIG_NAME = "config.yaml"
+SESSION_PROFILE_NAME = "profile.md"
+
+# Sort order sentinels
+UNKNOWN_LIFESTAGE_ORDER = 999
+UNKNOWN_CONFIDENCE_ORDER = 5
+
+# File encodings to try when reading source content
+ENCODING_FALLBACKS: list[str] = [
+    "utf-8",
+    "latin-1",
+    "windows-1252",
+    "cp1252",
+    "ISO-8859-1",
+]
 
 # ---------------------------------------------------------------------------
 # Globals
@@ -87,6 +118,11 @@ def get_config(config_path: str | None = None) -> dict[str, Any]:
 
     if config_path is None:
         config_path = os.getenv("KNOWME_CONFIG_PATH")
+
+    if config_path is None:
+        cwd_config = Path("config.yaml")
+        if cwd_config.exists():
+            config_path = str(cwd_config)
 
     if config_path is None:
         raise FileNotFoundError(
@@ -146,7 +182,9 @@ def get_connection(db_path: str) -> tuple[sqlite3.Connection, sqlite3.Cursor]:
 
 
 @contextmanager
-def db_cursor(db_path: str, *, commit: bool = False):
+def db_cursor(
+    db_path: str, *, commit: bool = False
+) -> Generator[tuple[sqlite3.Connection, sqlite3.Cursor], None, None]:
     """Context manager for DB access.  Commits if *commit* is True, always closes."""
     conn, cursor = get_connection(db_path)
     try:
@@ -542,15 +580,15 @@ def resolve_file_patterns(
     """Expand glob patterns into sorted, unique, absolute paths."""
     matched: set[str] = set()
     for pat in patterns:
-        abs_pat = pat if os.path.isabs(pat) else str(Path.cwd() / pat)
-        abs_pat = os.path.normpath(abs_pat)
+        p = Path(pat)
+        abs_pat = str(p if p.is_absolute() else (Path.cwd() / p).resolve())
         matched.update(glob_module.glob(abs_pat, recursive=recursive))
     return sorted(matched)
 
 
 def read_file_fallback(file_path: str | Path) -> str:
     """Read text file trying multiple encodings."""
-    for enc in ("utf-8", "latin-1", "windows-1252", "cp1252", "ISO-8859-1"):
+    for enc in ENCODING_FALLBACKS:
         try:
             return Path(file_path).read_text(encoding=enc)
         except UnicodeDecodeError:
@@ -1381,12 +1419,12 @@ class ProfileGenerator:
         for r in records:
             c = r["content"]
             ls = c.get("life_stage", "NOT_KNOWN")
-            ls_i = LIFE_STAGES.index(ls) if ls in LIFE_STAGES else 999
+            ls_i = LIFE_STAGES.index(ls) if ls in LIFE_STAGES else UNKNOWN_LIFESTAGE_ORDER
             author = r.get("author", "Consensus")
             conf = c.get("confidence", "MODERATE")
             items.append(
                 (
-                    (ls_i, author, conf_order.get(conf, 5)),
+                    (ls_i, author, conf_order.get(conf, UNKNOWN_CONFIDENCE_ORDER)),
                     {
                         "life_stage": ls,
                         "author": author,
@@ -1454,12 +1492,45 @@ class Query:
 
 
 # ===========================================================================
+# Shared pipeline helpers
+# ===========================================================================
+
+
+def _process_queue(
+    cfg: dict[str, Any],
+    observer_names: list[str],
+    *,
+    limit: int | None = None,
+    dryrun: bool = False,
+) -> int:
+    """Process pending queue items through analysis.  Returns count processed."""
+    mgr = AnalysisManager(cfg)
+    loader = Loader(cfg)
+    items = loader.get_queue_items(status="pending", limit=limit)
+    processed = 0
+    for item in items:
+        if dryrun:
+            console.print(f"[yellow]Would process: {item['title']}[/yellow]")
+            continue
+        sid = mgr.create_session(item)
+        if sid:
+            mgr.update_queue_status(item["id"], "completed")
+        else:
+            mgr.update_queue_status(item["id"], "failed")
+            continue
+        for sess in mgr.get_unanalyzed_sessions(observer_names):
+            mgr.run_multiple_analyses(sess["id"], observer_names)
+        processed += 1
+    return processed
+
+
+# ===========================================================================
 # CLI
 # ===========================================================================
 
 
 @click.group()
-@click.version_option(version="0.2.0")
+@click.version_option(version=VERSION)
 @click.option("--config", "config_path", type=click.Path(exists=True), help="Config file")
 @click.option("--db-path", type=click.Path(), help="Override database path")
 @click.option("--model", help="Override LLM model")
@@ -1520,10 +1591,11 @@ def init(ctx: click.Context, db_path: str | None) -> None:
     "-l",
     type=click.Choice([*LIFE_STAGES, "AUTO"], case_sensitive=False),
     default="AUTO",
+    help="Life stage of content",
 )
-@click.option("--priority", "-p", type=int, default=0)
+@click.option("--priority", "-p", type=int, default=0, help="Queue priority (higher = first)")
 @click.option("--list", "list_queue", is_flag=True, help="List queue contents")
-@click.option("--dryrun", is_flag=True)
+@click.option("--dryrun", is_flag=True, help="Show what would be loaded without loading")
 @click.pass_context
 def load(
     ctx: click.Context,
@@ -1602,9 +1674,9 @@ def load(
 @cli.command()
 @click.option("--queue", "-q", is_flag=True, help="Process queue items")
 @click.option("--queue-id", help="Process specific queue item")
-@click.option("--limit", "-l", type=int, default=1)
+@click.option("--limit", "-l", type=int, default=1, help="Max queue items to process")
 @click.option("--model", "-m", help="Override LLM model")
-@click.option("--dryrun", is_flag=True)
+@click.option("--dryrun", is_flag=True, help="Show what would be analyzed without running")
 @click.pass_context
 def analyze(
     ctx: click.Context,
@@ -1644,36 +1716,32 @@ def analyze(
             console.print("[yellow]Session already exists[/yellow]")
         return
 
-    items = loader.get_queue_items(status="pending", limit=limit)
-    if not items:
+    processed = _process_queue(cfg, observer_names, limit=limit, dryrun=dryrun)
+    if processed == 0 and not dryrun:
         console.print("[yellow]Queue is empty[/yellow]")
-        return
-
-    for item in items:
-        if dryrun:
-            console.print(f"[yellow]Would process: {item['title']}[/yellow]")
-            continue
-        sid = mgr.create_session(item)
-        if sid:
-            mgr.update_queue_status(item["id"], "completed")
-        else:
-            mgr.update_queue_status(item["id"], "failed")
-            continue
-
-        for sess in mgr.get_unanalyzed_sessions(observer_names):
-            mgr.run_multiple_analyses(sess["id"], observer_names)
 
 
 # -- merge ------------------------------------------------------------------
 
 
 @cli.command()
-@click.option("--threshold", "-t", default=0.85)
-@click.option("--dryrun", is_flag=True)
-@click.option("--reset", is_flag=True)
-@click.option("--type", "kr_type", type=click.Choice(["note", "fact"]), default="note")
-@click.option("--list", "list_clusters", is_flag=True)
-@click.option("--model", "-m", help="Override model")
+@click.option(
+    "--threshold",
+    "-t",
+    default=DEFAULT_MERGE_THRESHOLD,
+    help="Similarity threshold for clustering",
+)
+@click.option("--dryrun", is_flag=True, help="Show clusters without creating consensus")
+@click.option("--reset", is_flag=True, help="Reset existing consensus records")
+@click.option(
+    "--type",
+    "kr_type",
+    type=click.Choice(["note", "fact"]),
+    default="note",
+    help="Record type to cluster",
+)
+@click.option("--list", "list_clusters", is_flag=True, help="List clusters without merging")
+@click.option("--model", "-m", help="Override generative model")
 @click.pass_context
 def merge(
     ctx: click.Context,
@@ -1732,9 +1800,14 @@ def merge(
 
 
 @cli.command()
-@click.option("--threshold", "-t", default=0.92)
-@click.option("--reset", "-r", is_flag=True)
-@click.option("--dryrun", is_flag=True)
+@click.option(
+    "--threshold",
+    "-t",
+    default=DEFAULT_CONSENSUS_THRESHOLD,
+    help="Similarity threshold for consensus matching",
+)
+@click.option("--reset", "-r", is_flag=True, help="Reset similar consensus records")
+@click.option("--dryrun", is_flag=True, help="Show what would be reset without acting")
 @click.pass_context
 def consensus(
     ctx: click.Context,
@@ -1773,18 +1846,25 @@ def consensus(
 
 @cli.command()
 @click.argument("file_patterns", nargs=-1, type=click.Path())
-@click.option("--name", "-n")
-@click.option("--author", "-a")
+@click.option("--name", "-n", help="Name for the queued content")
+@click.option("--author", "-a", help="Content author")
 @click.option(
     "--lifestage",
     "-l",
     type=click.Choice([*LIFE_STAGES, "AUTO"], case_sensitive=False),
     default="AUTO",
+    help="Life stage of content",
 )
-@click.option("--type", "-t", "content_type", type=click.Choice(["document", "qa"]))
+@click.option(
+    "--type",
+    "-t",
+    "content_type",
+    type=click.Choice(["document", "qa"]),
+    help="Content type",
+)
 @click.option("--qa", is_flag=True, help="Process as QA transcript")
-@click.option("--list", "list_queue", is_flag=True)
-@click.option("--dryrun", is_flag=True)
+@click.option("--list", "list_queue", is_flag=True, help="List current queue")
+@click.option("--dryrun", is_flag=True, help="Show what would be queued without acting")
 @click.pass_context
 def queue(
     ctx: click.Context,
@@ -1865,7 +1945,7 @@ def queue(
 
 
 @cli.command()
-@click.option("--output", "-o", type=click.Path())
+@click.option("--output", "-o", type=click.Path(), help="Write profile to file")
 @click.option("--dump", "-d", is_flag=True, help="Dump raw observations")
 @click.option(
     "--format",
@@ -1873,8 +1953,15 @@ def queue(
     "fmt",
     type=click.Choice(["md", "json", "raw"]),
     default="md",
+    help="Output format",
 )
-@click.option("--mode", "-m", type=click.Choice(["short", "long"]), default="short")
+@click.option(
+    "--mode",
+    "-m",
+    type=click.Choice(["short", "long"]),
+    default="short",
+    help="Profile detail level",
+)
 @click.pass_context
 def profile(
     ctx: click.Context,
@@ -1907,8 +1994,8 @@ def profile(
 
 
 @cli.command("regen-embeddings")
-@click.option("--batch-size", type=int, default=100)
-@click.option("--dryrun", is_flag=True)
+@click.option("--batch-size", type=int, default=100, help="Records per batch")
+@click.option("--dryrun", is_flag=True, help="Show what would be regenerated without acting")
 @click.pass_context
 def regen_embeddings(ctx: click.Context, batch_size: int, dryrun: bool) -> None:
     """Regenerate embeddings for all knowledge records."""
@@ -1965,6 +2052,154 @@ def regen_embeddings(ctx: click.Context, batch_size: int, dryrun: bool) -> None:
         offset += batch_size
 
     console.print(f"[green]Done: {processed} processed, {success} ok, {failed} failed[/green]")
+
+
+# -- run --------------------------------------------------------------------
+
+
+def _prepare_session_db(source_db: str, session_db: str) -> None:
+    """Copy source DB to session path and clear analysis output tables."""
+    shutil.copy2(source_db, session_db)
+    with db_cursor(session_db, commit=True) as (_conn, cur):
+        cur.execute("DELETE FROM knowledge_records")
+        cur.execute("DELETE FROM processing_log")
+        cur.execute("UPDATE analysis_queue SET status = 'pending'")
+
+
+@cli.command()
+@click.option("--model", "-m", help="Override generative model for this run")
+@click.option("--limit", "-l", type=int, default=0, help="Limit queue items (0=all)")
+@click.option("--list", "list_runs", is_flag=True, help="List previous runs")
+@click.option("--dryrun", is_flag=True, help="Show what would happen")
+@click.pass_context
+def run(
+    ctx: click.Context,
+    model: str | None,
+    limit: int,
+    list_runs: bool,
+    dryrun: bool,
+) -> None:
+    """Run full analysis pipeline (analyze + merge + profile) into a session folder."""
+    cfg = ctx.obj
+    results_dir = Path("results")
+
+    if list_runs:
+        if not results_dir.exists():
+            console.print("[yellow]No results directory[/yellow]")
+            return
+        dirs = sorted(
+            [
+                d
+                for d in results_dir.iterdir()
+                if d.is_dir() and (d / SESSION_DB_NAME).exists()
+            ],
+            key=lambda d: d.name,
+            reverse=True,
+        )
+        if not dirs:
+            console.print("[yellow]No previous runs found[/yellow]")
+            return
+        table = Table(title="Previous Runs")
+        table.add_column("Session")
+        table.add_column("Model")
+        table.add_column("Records", justify="right")
+        table.add_column("Consensus", justify="right")
+        for d in dirs:
+            db_path = str(d / SESSION_DB_NAME)
+            with db_cursor(db_path) as (_conn, cur):
+                cur.execute("SELECT COUNT(*) FROM knowledge_records")
+                kr_count = cur.fetchone()[0]
+                cur.execute(
+                    "SELECT COUNT(*) FROM knowledge_records WHERE consensus_id IS NOT NULL"
+                )
+                cons_count = cur.fetchone()[0]
+            # Parse model from dir name: YYYY-MM-DD_HHMM_modelname
+            parts = d.name.split("_", 2)
+            model_name = parts[2] if len(parts) > 2 else "unknown"
+            table.add_row(d.name, model_name, str(kr_count), str(cons_count))
+        console.print(table)
+        return
+
+    # Determine model
+    gen_model = model or loaden.get(cfg, "llm.generative_model")
+    source_db = loaden.get(cfg, "database.path")
+
+    if not Path(source_db).exists():
+        console.print(f"[red]Source database not found: {source_db}[/red]")
+        return
+
+    # Create session directory
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M")
+    safe_model = re.sub(r"[^\w\-.]", "_", gen_model)
+    session_dir = results_dir / f"{ts}_{safe_model}"
+
+    if dryrun:
+        console.print(f"[yellow]Would create session: {session_dir}[/yellow]")
+        console.print(f"[yellow]Model: {gen_model}[/yellow]")
+        console.print(f"[yellow]Source DB: {source_db}[/yellow]")
+        return
+
+    session_dir.mkdir(parents=True, exist_ok=True)
+    session_db = str(session_dir / SESSION_DB_NAME)
+
+    # Copy and prepare session DB
+    console.print(f"[blue]Preparing session DB from {source_db}...[/blue]")
+    _prepare_session_db(source_db, session_db)
+
+    # Snapshot config
+    config_snapshot = dict(cfg)
+    config_snapshot["_session"] = {
+        "model": gen_model,
+        "source_db": str(Path(source_db).resolve()),
+        "session_db": session_db,
+        "created_at": datetime.now(UTC).isoformat(),
+    }
+    (session_dir / SESSION_CONFIG_NAME).write_text(
+        yaml.dump(config_snapshot, default_flow_style=False, sort_keys=False),
+        encoding="utf-8",
+    )
+
+    # Point config at session DB and model
+    cfg["database"]["path"] = session_db
+    cfg["llm"]["generative_model"] = gen_model
+
+    # --- Analyze ---
+    console.print(f"\n[bold cyan]═══ Analyzing with {gen_model} ═══[/bold cyan]")
+    observer_names = [o["name"] for o in loaden.get(cfg, "roles.Observers", [])]
+    processed = _process_queue(cfg, observer_names, limit=limit or None)
+    if processed == 0:
+        console.print("[yellow]No queue items to analyze[/yellow]")
+
+    # --- Merge ---
+    console.print("\n[bold cyan]═══ Merging clusters ═══[/bold cyan]")
+    cm = ConsensusManager(cfg)
+    merge_result = cm.process_clusters(threshold=DEFAULT_MERGE_THRESHOLD, kr_type="note")
+    console.print(
+        f"[green]Created {merge_result['consensus_count']} consensus records "
+        f"from {merge_result['cluster_count']} clusters[/green]"
+    )
+
+    # --- Profile ---
+    console.print("\n[bold cyan]═══ Generating profile ═══[/bold cyan]")
+    gen = ProfileGenerator(cfg)
+    profile_content = gen.generate_profile("md", "long")
+    profile_path = session_dir / SESSION_PROFILE_NAME
+    profile_path.write_text(profile_content, encoding="utf-8")
+    console.print(f"[green]Profile written to {profile_path}[/green]")
+
+    # --- Summary ---
+    with db_cursor(session_db) as (_conn, cur):
+        cur.execute("SELECT COUNT(*) FROM knowledge_records")
+        kr_count = cur.fetchone()[0]
+        cur.execute("SELECT COUNT(*) FROM knowledge_records WHERE consensus_id IS NOT NULL")
+        cons_count = cur.fetchone()[0]
+
+    console.print("\n[bold green]═══ Run Complete ═══[/bold green]")
+    console.print(f"  Model:     {gen_model}")
+    console.print(f"  Session:   {session_dir}")
+    console.print(f"  Records:   {kr_count}")
+    console.print(f"  Consensus: {cons_count}")
+    console.print(f"  Profile:   {profile_path}")
 
 
 # ---------------------------------------------------------------------------
