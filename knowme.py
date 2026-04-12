@@ -22,6 +22,7 @@ import os
 import re
 import shutil
 import sqlite3
+import time
 from collections import defaultdict
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 import click
+import httpx
 import llm as llm_lib
 import loaden
 import numpy as np
@@ -449,9 +451,23 @@ def call_llm(
         input_str = str(input_content)
 
     model = llm_lib.get_model(model_name or "gpt-4o-mini")
-    response = model.prompt(prompt=f"{prompt}\n\n{input_str}")
 
-    response_dict = response.json()
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            response = model.prompt(prompt=f"{prompt}\n\n{input_str}")
+            response_dict = response.json()
+            break
+        except (ConnectionError, OSError, httpx.NetworkError) as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                logger.warning(
+                    "LLM call failed (attempt %d/%d): %s — retrying in %ds",
+                    attempt + 1, max_retries, e, wait,
+                )
+                time.sleep(wait)
+            else:
+                raise
     content_str: str = response_dict["content"]
 
     if json_output:
@@ -866,11 +882,55 @@ class Loader:
 # ---------------------------------------------------------------------------
 
 
+def _find_cached_records(
+    results_dir: Path,
+    source_id: str,
+    role_name: str,
+    model_name: str,
+    current_session_db: str,
+) -> list[dict[str, Any]]:
+    """Search previous session DBs for cached analysis records.
+
+    Returns matching knowledge_records if a previous run with the same
+    model already analyzed this source with this role.
+    """
+    safe_model = re.sub(r"[^\w\-.]", "_", model_name)
+    for session_dir in sorted(results_dir.iterdir(), reverse=True):
+        db_file = session_dir / SESSION_DB_NAME
+        if not db_file.exists() or str(db_file) == current_session_db:
+            continue
+        # Only check sessions from the same model
+        if safe_model not in session_dir.name:
+            continue
+        try:
+            conn = sqlite3.connect(str(db_file))
+            conn.row_factory = sqlite3.Row
+            cur = conn.cursor()
+            cur.execute(
+                """SELECT kr.id, kr.type, kr.author, kr.content, kr.created_at,
+                          kr.version, kr.embedding, kr.session_id, kr.keywords
+                   FROM knowledge_records kr
+                   JOIN sessions s ON kr.session_id = s.id
+                   WHERE s.source_id = ? AND kr.author = ?""",
+                (source_id, role_name),
+            )
+            rows = [dict(r) for r in cur.fetchall()]
+            conn.close()
+            if rows:
+                return rows
+        except Exception:
+            logger.debug("Cache read failed for %s", db_file)
+            continue
+    return []
+
+
 class AnalysisManager:
     """Run LLM expert analyses on sessions."""
 
     def __init__(self, config: dict[str, Any]) -> None:
         self.config = config
+        self.cache_enabled: bool = False
+        self.results_dir: Path = Path("results")
 
     @property
     def _db(self) -> str:
@@ -969,6 +1029,44 @@ class AnalysisManager:
         conn.close()
         return note_ids or None
 
+    def _try_cache(self, session_id: str, role: str) -> int:
+        """Try to load cached records for this session+role. Returns count loaded."""
+        conn, cursor = get_connection(self._db)
+        cursor.execute("SELECT source_id FROM sessions WHERE id = ?", (session_id,))
+        row = cursor.fetchone()
+        conn.close()
+        if not row:
+            return 0
+
+        cached = _find_cached_records(
+            self.results_dir, row["source_id"], role, self._model, self._db,
+        )
+        if not cached:
+            return 0
+
+        conn, cursor = get_connection(self._db)
+        count = 0
+        for rec in cached:
+            new_id = generate_id("note", session_id, role)
+            try:
+                cursor.execute(
+                    """INSERT INTO knowledge_records
+                       (id, type, author, content, created_at, version,
+                        embedding, session_id, keywords)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        new_id, rec["type"], rec["author"], rec["content"],
+                        rec["created_at"], rec["version"], rec["embedding"],
+                        session_id, rec["keywords"],
+                    ),
+                )
+                count += 1
+            except Exception:
+                logger.exception("Error copying cached record")
+        conn.commit()
+        conn.close()
+        return count
+
     def run_multiple_analyses(self, session_id: str, role_names: list[str]) -> dict[str, int]:
         """Run all observer roles on a session, skipping already-done."""
         conn, cursor = get_connection(self._db)
@@ -990,6 +1088,15 @@ class AnalysisManager:
                 results[role] = 0
                 continue
             conn.close()
+
+            if self.cache_enabled:
+                cached_count = self._try_cache(session_id, role)
+                if cached_count > 0:
+                    console.print(
+                        f"[blue]  Cached {role}: {cached_count} records[/blue]"
+                    )
+                    results[role] = cached_count
+                    continue
 
             ids = self.run_role_analysis(session_id, role)
             results[role] = len(ids) if ids else 0
@@ -1368,18 +1475,28 @@ class ProfileGenerator:
                 org[ls]["Unclassified"].append(r)
         return org
 
+    @staticmethod
+    def _load_role_prompt(role_file: str) -> str:
+        role_path = Path(__file__).parent / "roles" / role_file
+        return role_path.read_text()
+
     def _synthesize(
         self,
         organized: dict[str, dict[str, list[dict[str, Any]]]],
         mode: str,
     ) -> dict[str, Any]:
         model = loaden.get(self.config, "llm.generative_model")
-        prompt = (
-            "You are an expert biographer. Synthesize the observations into a "
-            "cohesive biographical narrative. For each life stage create a section. "
-            "Include a brief overall summary. Respond as JSON: "
-            '{"summary": "...", "life_stages": [{"stage": "...", "narrative": "..."}]}'
-        )
+        if mode == "collaborator":
+            prompt = self._load_role_prompt("Role-CollaboratorProfile.md")
+        elif mode == "agent":
+            prompt = self._load_role_prompt("Role-AgentProfile.md")
+        else:
+            prompt = (
+                "You are an expert biographer. Synthesize the observations into a "
+                "cohesive biographical narrative. For each life stage create a section. "
+                "Include a brief overall summary. Respond as JSON: "
+                '{"summary": "...", "life_stages": [{"stage": "...", "narrative": "..."}]}'
+            )
         input_data: dict[str, Any] = {"mode": mode, "life_stages": {}}
         for ls, domains in organized.items():
             input_data["life_stages"][ls] = {}
@@ -1405,6 +1522,14 @@ class ProfileGenerator:
 
     @staticmethod
     def _format_markdown(content: dict[str, Any]) -> str:
+        # Section-based format (collaborator / agent profiles)
+        if "sections" in content:
+            purpose = content.get("purpose", "Profile")
+            md = f"# {purpose}\n\n"
+            for section in content["sections"]:
+                md += f"## {section['heading']}\n\n{section['content']}\n\n"
+            return md
+        # Life-stage format (short / long biographical profiles)
         md = f"# Personal Profile\n\n## Summary\n\n{content.get('summary', '')}\n\n"
         for stage in content.get("life_stages", []):
             title = stage["stage"].replace("_", " ").title()
@@ -1502,11 +1627,13 @@ def _process_queue(
     *,
     limit: int | None = None,
     dryrun: bool = False,
+    cache: bool = False,
 ) -> int:
     """Process pending queue items through analysis.  Returns count processed."""
     mgr = AnalysisManager(cfg)
+    mgr.cache_enabled = cache
     loader = Loader(cfg)
-    items = loader.get_queue_items(status="pending", limit=limit)
+    items = loader.get_queue_items(status="pending", limit=limit or 0)
     processed = 0
     for item in items:
         if dryrun:
@@ -1518,8 +1645,13 @@ def _process_queue(
         else:
             mgr.update_queue_status(item["id"], "failed")
             continue
-        for sess in mgr.get_unanalyzed_sessions(observer_names):
-            mgr.run_multiple_analyses(sess["id"], observer_names)
+        try:
+            for sess in mgr.get_unanalyzed_sessions(observer_names):
+                mgr.run_multiple_analyses(sess["id"], observer_names)
+        except FileNotFoundError as e:
+            console.print(f"[red]Skipping {item['title']}: {e}[/red]")
+            mgr.update_queue_status(item["id"], "failed")
+            continue
         processed += 1
     return processed
 
@@ -1958,9 +2090,9 @@ def queue(
 @click.option(
     "--mode",
     "-m",
-    type=click.Choice(["short", "long"]),
+    type=click.Choice(["short", "long", "collaborator", "agent"]),
     default="short",
-    help="Profile detail level",
+    help="Profile type: short/long biography, collaborator guide, or agent decision spec",
 )
 @click.pass_context
 def profile(
@@ -2063,6 +2195,7 @@ def _prepare_session_db(source_db: str, session_db: str) -> None:
     with db_cursor(session_db, commit=True) as (_conn, cur):
         cur.execute("DELETE FROM knowledge_records")
         cur.execute("DELETE FROM processing_log")
+        cur.execute("DELETE FROM sessions")
         cur.execute("UPDATE analysis_queue SET status = 'pending'")
 
 
@@ -2071,6 +2204,7 @@ def _prepare_session_db(source_db: str, session_db: str) -> None:
 @click.option("--limit", "-l", type=int, default=0, help="Limit queue items (0=all)")
 @click.option("--list", "list_runs", is_flag=True, help="List previous runs")
 @click.option("--dryrun", is_flag=True, help="Show what would happen")
+@click.option("--cache", is_flag=True, help="Reuse analysis from previous same-model runs")
 @click.pass_context
 def run(
     ctx: click.Context,
@@ -2078,6 +2212,7 @@ def run(
     limit: int,
     list_runs: bool,
     dryrun: bool,
+    cache: bool,
 ) -> None:
     """Run full analysis pipeline (analyze + merge + profile) into a session folder."""
     cfg = ctx.obj
@@ -2166,7 +2301,9 @@ def run(
     # --- Analyze ---
     console.print(f"\n[bold cyan]═══ Analyzing with {gen_model} ═══[/bold cyan]")
     observer_names = [o["name"] for o in loaden.get(cfg, "roles.Observers", [])]
-    processed = _process_queue(cfg, observer_names, limit=limit or None)
+    processed = _process_queue(
+        cfg, observer_names, limit=limit if limit > 0 else None, cache=cache,
+    )
     if processed == 0:
         console.print("[yellow]No queue items to analyze[/yellow]")
 
