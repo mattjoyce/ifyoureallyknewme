@@ -235,6 +235,7 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "llm" },
+    { name = "llm-ollama" },
     { name = "loaden" },
     { name = "numpy" },
     { name = "openai" },
@@ -251,6 +252,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1" },
     { name = "llm", specifier = ">=0.23" },
+    { name = "llm-ollama", specifier = ">=0.15" },
     { name = "loaden", specifier = ">=0.1" },
     { name = "numpy", specifier = ">=2.0" },
     { name = "openai", specifier = ">=1.0" },
@@ -285,6 +287,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/5c/eb/96e051501bc3ca624f402595601942d792f333bef14405eab61fa690861e/llm-0.30.tar.gz", hash = "sha256:77801e45bf00908c6e62c747e2ca251af1cf4d90f67ba629307022fad2ef89cc", size = 85839, upload-time = "2026-03-31T20:37:36.245Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/20/72/72f7327c50209592f5acc1957eda3fb4a0d3532b140e4be99f60027cb45f/llm-0.30-py3-none-any.whl", hash = "sha256:9edf606dfb6330b2cc03bcc6cd94660d75820619f7d74df9c842691a2f59f0e1", size = 83325, upload-time = "2026-03-31T20:37:34.844Z" },
+]
+
+[[package]]
+name = "llm-ollama"
+version = "0.15.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "llm" },
+    { name = "ollama" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c3/95/654b9e2e5f821ed2eaf5f3227b49e554e9195de89e8346d7d5dcc1ddca4f/llm_ollama-0.15.1.tar.gz", hash = "sha256:618d517c3c133f746bb68b4903425b837175818022a49da56333e41eb37ec21f", size = 23638, upload-time = "2025-10-29T11:22:44.093Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ee/e2/b36c34b410940eb3d5259f00a94ac8605c383fec6fed8fc8e06b864f077c/llm_ollama-0.15.1-py3-none-any.whl", hash = "sha256:aa9e46e0dce7e12b7f8291ea9fe004b4c0c7b02567283c9938563cd9308f34f8", size = 16218, upload-time = "2025-10-29T11:22:42.901Z" },
 ]
 
 [[package]]
@@ -397,6 +413,19 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c7/a8/379542d45a14f149444c5c4c4e7714707239ce9cc1de8c2803958889da14/numpy-2.4.4-pp311-pypy311_pp73-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:19710a9ca9992d7174e9c52f643d4272dcd1558c5f7af7f6f8190f633bd651a7", size = 15804253, upload-time = "2026-03-29T13:21:50.753Z" },
     { url = "https://files.pythonhosted.org/packages/a2/c8/f0a45426d6d21e7ea3310a15cf90c43a14d9232c31a837702dba437f3373/numpy-2.4.4-pp311-pypy311_pp73-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:9b2aec6af35c113b05695ebb5749a787acd63cafc83086a05771d1e1cd1e555f", size = 16753552, upload-time = "2026-03-29T13:21:54.344Z" },
     { url = "https://files.pythonhosted.org/packages/04/74/f4c001f4714c3ad9ce037e18cf2b9c64871a84951eaa0baf683a9ca9301c/numpy-2.4.4-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:f2cf083b324a467e1ab358c105f6cad5ea950f50524668a80c486ff1db24e119", size = 12509075, upload-time = "2026-03-29T13:21:57.644Z" },
+]
+
+[[package]]
+name = "ollama"
+version = "0.6.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9d/5a/652dac4b7affc2b37b95386f8ae78f22808af09d720689e3d7a86b6ed98e/ollama-0.6.1.tar.gz", hash = "sha256:478c67546836430034b415ed64fa890fd3d1ff91781a9d548b3325274e69d7c6", size = 51620, upload-time = "2025-11-13T23:02:17.416Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/47/4f/4a617ee93d8208d2bcf26b2d8b9402ceaed03e3853c754940e2290fed063/ollama-0.6.1-py3-none-any.whl", hash = "sha256:fc4c984b345735c5486faeee67d8a265214a31cbb828167782dc642ce0a2bf8c", size = 14354, upload-time = "2025-11-13T23:02:16.292Z" },
 ]
 
 [[package]]

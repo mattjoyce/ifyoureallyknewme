@@ -9,6 +9,7 @@ dependencies = [
     "click>=8.1",
     "loaden>=0.1",
     "llm>=0.23",
+    "llm-ollama>=0.15",
     "numpy>=2.0",
     "openai>=1.0",
     "rich>=13.0",

@@ -443,6 +443,7 @@ def call_llm(
     prompt: str,
     model_name: str,
     json_output: bool = True,
+    options: dict[str, Any] | None = None,
 ) -> Any:
     """Call an LLM via Simon Willison's ``llm`` library."""
     if isinstance(input_content, (dict, list)):
@@ -451,24 +452,27 @@ def call_llm(
         input_str = str(input_content)
 
     model = llm_lib.get_model(model_name or "gpt-4o-mini")
+    prompt_kwargs: dict[str, Any] = dict(options or {})
 
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = model.prompt(prompt=f"{prompt}\n\n{input_str}")
-            response_dict = response.json()
+            response = model.prompt(prompt=f"{prompt}\n\n{input_str}", **prompt_kwargs)
+            content_str: str = response.text()
             break
         except (ConnectionError, OSError, httpx.NetworkError) as e:
             if attempt < max_retries - 1:
                 wait = 2 ** (attempt + 1)
                 logger.warning(
                     "LLM call failed (attempt %d/%d): %s — retrying in %ds",
-                    attempt + 1, max_retries, e, wait,
+                    attempt + 1,
+                    max_retries,
+                    e,
+                    wait,
                 )
                 time.sleep(wait)
             else:
                 raise
-    content_str: str = response_dict["content"]
 
     if json_output:
         try:
@@ -505,7 +509,8 @@ def llm_process(
 ) -> Any:
     """High-level: call LLM, return parsed result."""
     model = model or loaden.get(config, "llm.generative_model")
-    return call_llm(input_content, prompt, model, json_output=expect_json)
+    options = loaden.get(config, "llm.options", {}) or {}
+    return call_llm(input_content, prompt, model, json_output=expect_json, options=options)
 
 
 def get_role_file(config: dict[str, Any], role_name: str, role_type: str) -> Path:
@@ -1039,7 +1044,11 @@ class AnalysisManager:
             return 0
 
         cached = _find_cached_records(
-            self.results_dir, row["source_id"], role, self._model, self._db,
+            self.results_dir,
+            row["source_id"],
+            role,
+            self._model,
+            self._db,
         )
         if not cached:
             return 0
@@ -1055,9 +1064,15 @@ class AnalysisManager:
                         embedding, session_id, keywords)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
-                        new_id, rec["type"], rec["author"], rec["content"],
-                        rec["created_at"], rec["version"], rec["embedding"],
-                        session_id, rec["keywords"],
+                        new_id,
+                        rec["type"],
+                        rec["author"],
+                        rec["content"],
+                        rec["created_at"],
+                        rec["version"],
+                        rec["embedding"],
+                        session_id,
+                        rec["keywords"],
                     ),
                 )
                 count += 1
@@ -1092,9 +1107,7 @@ class AnalysisManager:
             if self.cache_enabled:
                 cached_count = self._try_cache(session_id, role)
                 if cached_count > 0:
-                    console.print(
-                        f"[blue]  Cached {role}: {cached_count} records[/blue]"
-                    )
+                    console.print(f"[blue]  Cached {role}: {cached_count} records[/blue]")
                     results[role] = cached_count
                     continue
 
@@ -2302,7 +2315,10 @@ def run(
     console.print(f"\n[bold cyan]═══ Analyzing with {gen_model} ═══[/bold cyan]")
     observer_names = [o["name"] for o in loaden.get(cfg, "roles.Observers", [])]
     processed = _process_queue(
-        cfg, observer_names, limit=limit if limit > 0 else None, cache=cache,
+        cfg,
+        observer_names,
+        limit=limit if limit > 0 else None,
+        cache=cache,
     )
     if processed == 0:
         console.print("[yellow]No queue items to analyze[/yellow]")

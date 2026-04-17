@@ -1,0 +1,56 @@
+loaden_env: .env
+
+# Database configuration
+database:
+  path: private/test.db
+  schema_path: schema.sql
+
+# LLM configuration
+# Generative model routed via the `llm-ollama` plugin to a remote ollama host.
+# Set OLLAMA_HOST=http://192.168.20.8:11434 in the environment before invoking knowme.
+#
+# NOTE: embedding_model still points at OpenAI — get_embedding() in knowme.py is
+# hardcoded to the OpenAI client, so ollama embedding models won't work here.
+# The `profile` command does not compute embeddings, so this file is safe for
+# profile generation. For analyze/merge/regen-embeddings use config.yaml.
+llm:
+  generative_model: gemma4:latest
+  embedding_model: text-embedding-3-small
+  # Provider-specific options forwarded to model.prompt(**options).
+  # num_ctx is required for ollama when input exceeds the default 8K context
+  # — otherwise the model sees truncated input and emits unparseable text.
+  options:
+    num_ctx: 32768
+
+# Role configuration
+roles:
+  path: ./roles
+  schema_file: Prompt-Schema.md
+  Observers:
+    - name: Psychologist
+      file: Role-Psychologist.md
+    - name: Demographer
+      file: Role-Demographer.md
+    - name: BehavioralEconomist
+      file: Role-BehavioralEconomist.md
+    - name: PoliticalScientist
+      file: Role-PoliticalScientist.md
+  Helpers:
+    - name: FactExtractor
+      file: Role-FactExtractor.md
+    - name: ConsensusMaker
+      file: Role-ConsensusMaker.md
+    - name: CoverageAssessor
+      file: Role-CoverageAssessor.md
+    - name: KeywordExtractor
+      file: Role-KeywordExtractor.md
+    - name: Interviewer
+      file: Role-Interviewer.md
+
+content:
+  default_author: "Matt"
+
+# Logging configuration
+logging:
+  level: INFO
+  file: private/knowme.log
