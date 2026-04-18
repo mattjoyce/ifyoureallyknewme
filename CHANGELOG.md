@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-04-18
+- Adds Ollama support via the llm-ollama plugin, with provider options.
+
 ## 2026-04-12
 - Add collaborator and agent profile modes.
 - Add caching to improve performance.
